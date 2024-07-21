@@ -6,7 +6,10 @@ edition = "2021"
 [dependencies]
 arboard = "3.4.0"
 clap = { version = "4.5.9", features = ["derive"] }
+dirs = "5.0.1"
 futures = "0.3.30"
+serde = { version = "1.0.204", features = ["derive"] }
+serde_yaml = "0.9.34"
 tarpc = { version = "0.34.0", features = ["full"] }
 tokio = { version = "1.38.1", features = ["full"] }
 
