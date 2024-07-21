@@ -36,7 +36,7 @@ async fn main() {
         let config: Config =
             serde_yaml::from_str(&std::fs::read_to_string(default_config_file).unwrap()).unwrap();
         server_addr = config.server_addr.parse().unwrap();
-    } else if args.server_addr.is_some() && args.config.is_some() {
+    } else if args.server_addr.is_some() {
         eprintln!("Both server address and config file provided, using server address");
         server_addr = args.server_addr.unwrap().parse().unwrap();
     } else {
