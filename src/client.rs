@@ -1,7 +1,7 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use rpclip::RpClipClient;
 use serde::Deserialize;
-use std::net::SocketAddr;
+use std::{io::BufRead, net::SocketAddr};
 use tarpc::{client, context, tokio_serde::formats::Bincode};
 
 #[derive(Parser)]
@@ -10,6 +10,14 @@ struct Args {
     server: Option<String>,
     #[clap(short, long)]
     config: Option<String>,
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    Get,
+    Set,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -56,10 +64,20 @@ async fn main() {
     )
     .spawn();
 
-    let res = client
-        .get_clip(context::current())
-        .await
-        .expect("Unable to get clip");
-    let res = rpclip::line_end::to_platform_line_ending(&res);
-    println!("{}", res);
+    match &args.command {
+        Commands::Get => {
+            let text = client.get_clip(context::current()).await.unwrap();
+            let text = rpclip::line_end::to_platform_line_ending(&text);
+            print!("{}", text);
+        }
+        Commands::Set => {
+            // read from stdin
+            let content: Vec<String> = std::io::stdin()
+                .lock()
+                .lines()
+                .map(|line| line.unwrap())
+                .collect();
+            client.set_clip(context::current(), content.join("\n")).await.unwrap();
+        }
+    }
 }
