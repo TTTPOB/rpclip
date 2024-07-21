@@ -1,0 +1,19 @@
+[package]
+name = "rpclip"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arboard = "3.4.0"
+clap = { version = "4.5.9", features = ["derive"] }
+futures = "0.3.30"
+tarpc = { version = "0.34.0", features = ["full"] }
+tokio = { version = "1.38.1", features = ["full"] }
+
+[[bin]]
+name = "rpclip-server"
+path = "src/server.rs"
+
+[[bin]]
+name = "rpclip-client"
+path = "src/client.rs"
