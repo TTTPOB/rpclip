@@ -9,10 +9,19 @@ jobs:
     name: Build On Windows
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v2
-      - <<: *cache_cargo_registry
-      - <<: *cache_cargo_index
-      - <<: *cache_cargo_build
+      - uses: actions/checkout@v4
+      - name: Cache Cargo Registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache Cargo Index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/index
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache Cargo Build
+        uses: actions/cache@v3
         with:
           path: target
           key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}-windows
@@ -36,10 +45,19 @@ jobs:
     name: Build On x86_64-linux-musl
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - <<: *cache_cargo_registry
-      - <<: *cache_cargo_index
-      - <<: *cache_cargo_build
+      - uses: actions/checkout@v4
+      - name: Cache Cargo Registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache Cargo Index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/index
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache Cargo Build
+        uses: actions/cache@v3
         with:
           path: target
           key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}-x86_64-linux-musl
@@ -48,6 +66,9 @@ jobs:
           toolchain: stable
           target: x86_64-unknown-linux-musl
           override: true
+      - uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: cross
       - uses: actions-rs/cargo@v1
         with:
           use-cross: true
@@ -56,19 +77,28 @@ jobs:
       - name: Upload x86_64-linux-musl Build Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: x86_64-linux-musl-binaries
+          name: x86_64-linux-musl-rpclip-binaries
           path: |
             target/x86_64-unknown-linux-musl/release/rpclip-server
-            target/x86_64-unknown-linux-musl/release/rpclip-server
+            target/x86_64-unknown-linux-musl/release/rpclip-client
 
   build_aarch64-linux-musl:
     name: Build On aarch64-linux-musl
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - <<: *cache_cargo_registry
-      - <<: *cache_cargo_index
-      - <<: *cache_cargo_build
+      - uses: actions/checkout@v4
+      - name: Cache Cargo Registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache Cargo Index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/index
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+      - name: Cache Cargo Build
+        uses: actions/cache@v3
         with:
           path: target
           key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}-aarch64-linux-musl
@@ -77,13 +107,16 @@ jobs:
           toolchain: stable
           target: aarch64-unknown-linux-musl
           override: true
+      - uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: cross
       - uses: actions-rs/cargo@v1
         with:
           use-cross: true
           command: build
           args: --release --target aarch64-unknown-linux-musl
-      - name: Upload aarch64-linux-musl Server Build Artifact
-        uses: actions/upload-artifact@v3
+      - name: Upload aarch64-linux-musl Build Artifact
+        uses: actions/upload-artifact@v4
         with:
           name: aarch64-linux-musl-rpclip-binaries
           path: |
@@ -110,6 +143,10 @@ jobs:
         with:
           name: aarch64-linux-musl-rpclip-binaries
           path: ./aarch64-linux-musl-rpclip-binaries
+      # ls downloaded files
+      - name: List Downloaded Artifacts
+        run: |
+          ls -lhaR
       - name: Create GitHub Release
         id: create_release
         uses: actions/create-release@v1
@@ -177,21 +214,3 @@ jobs:
           asset_path: ./aarch64-linux-musl-rpclip-binaries/rpclip-client
           asset_name: rpclip-client-aarch64-linux-musl
           asset_content_type: application/octet-stream
-
-# Anchors for repeated steps
-anchors:
-  cache_cargo_registry: &cache_cargo_registry
-    name: Cache Cargo Registry
-    uses: actions/cache@v3
-    with:
-      path: ~/.cargo/registry
-      key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-  cache_cargo_index: &cache_cargo_index
-    name: Cache Cargo Index
-    uses: actions/cache@v3
-    with:
-      path: ~/.cargo/index
-      key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-  cache_cargo_build: &cache_cargo_build
-    name: Cache Cargo Build
-    uses: actions/cache@v3
