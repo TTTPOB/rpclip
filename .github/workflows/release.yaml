@@ -10,6 +10,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v2
+      - <<: *cache_cargo_registry
+      - <<: *cache_cargo_index
+      - <<: *cache_cargo_build
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}-windows
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
@@ -19,16 +25,24 @@ jobs:
           command: build
           args: --release
       - name: Upload Windows Build Artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: windows-build
-          path: target/release/
+          name: windows-rpclip-binaries
+          path: |
+            target/release/rpclip-server.exe
+            target/release/rpclip-client.exe
 
   build_x86_64-linux-musl:
     name: Build On x86_64-linux-musl
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
+      - <<: *cache_cargo_registry
+      - <<: *cache_cargo_index
+      - <<: *cache_cargo_build
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}-x86_64-linux-musl
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
@@ -40,16 +54,24 @@ jobs:
           command: build
           args: --release --target x86_64-unknown-linux-musl
       - name: Upload x86_64-linux-musl Build Artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: x86_64-linux-musl-build
-          path: target/x86_64-unknown-linux-musl/release/
+          name: x86_64-linux-musl-binaries
+          path: |
+            target/x86_64-unknown-linux-musl/release/rpclip-server
+            target/x86_64-unknown-linux-musl/release/rpclip-server
 
   build_aarch64-linux-musl:
     name: Build On aarch64-linux-musl
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
+      - <<: *cache_cargo_registry
+      - <<: *cache_cargo_index
+      - <<: *cache_cargo_build
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}-aarch64-linux-musl
       - uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
@@ -60,11 +82,13 @@ jobs:
           use-cross: true
           command: build
           args: --release --target aarch64-unknown-linux-musl
-      - name: Upload aarch64-linux-musl Build Artifact
+      - name: Upload aarch64-linux-musl Server Build Artifact
         uses: actions/upload-artifact@v3
         with:
-          name: aarch64-linux-musl-build
-          path: target/aarch64-unknown-linux-musl/release/
+          name: aarch64-linux-musl-rpclip-binaries
+          path: |
+            target/aarch64-unknown-linux-musl/release/rpclip-server
+            target/aarch64-unknown-linux-musl/release/rpclip-client
 
   release:
     name: Create GitHub Release
@@ -72,23 +96,20 @@ jobs:
     needs: [build_windows, build_x86_64-linux-musl, build_aarch64-linux-musl]
     steps:
       - name: Download Windows Build Artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
-          name: windows-build
-          path: ./windows-build
-
+          name: windows-rpclip-binaries
+          path: ./windows-rpclip-binaries
       - name: Download x86_64-linux-musl Build Artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
-          name: x86_64-linux-musl-build
-          path: ./x86_64-linux-musl-build
-
+          name: x86_64-linux-musl-rpclip-binaries
+          path: ./x86_64-linux-musl-rpclip-binaries
       - name: Download aarch64-linux-musl Build Artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
-          name: aarch64-linux-musl-build
-          path: ./aarch64-linux-musl-build
-
+          name: aarch64-linux-musl-rpclip-binaries
+          path: ./aarch64-linux-musl-rpclip-binaries
       - name: Create GitHub Release
         id: create_release
         uses: actions/create-release@v1
@@ -106,26 +127,71 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./windows-build
-          asset_name: windows-build.zip
-          asset_content_type: application/zip
-
-      - name: Upload x86_64-linux-musl Build to Release
+          asset_path: ./windows-rpclip-binaries/rpclip-server.exe
+          asset_name: rpclip-server-windows.exe
+          asset_content_type: application/octet-stream
+      - name: Upload Windows Client Build to Release
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./x86_64-linux-musl-build
-          asset_name: x86_64-linux-musl-build.zip
-          asset_content_type: application/zip
+          asset_path: ./windows-rpclip-binaries/rpclip-client.exe
+          asset_name: rpclip-client-windows.exe
+          asset_content_type: application/octet-stream
 
-      - name: Upload aarch64-linux-musl Build to Release
+      - name: Upload x86_64-linux-musl Server Build to Release
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./aarch64-linux-musl-build
-          asset_name: aarch64-linux-musl-build.zip
-          asset_content_type: application/zip
+          asset_path: ./x86_64-linux-musl-rpclip-binaries/rpclip-server
+          asset_name: rpclip-server-x86_64-linux-musl
+          asset_content_type: application/octet-stream
+      - name: Upload x86_64-linux-musl Client Build to Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./x86_64-linux-musl-rpclip-binaries/rpclip-client
+          asset_name: rpclip-client-x86_64-linux-musl
+          asset_content_type: application/octet-stream
+
+      - name: Upload aarch64-linux-musl Server Build to Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./aarch64-linux-musl-rpclip-binaries/rpclip-server
+          asset_name: rpclip-server-aarch64-linux-musl
+          asset_content_type: application/octet-stream
+      - name: Upload aarch64-linux-musl Client Build to Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./aarch64-linux-musl-rpclip-binaries/rpclip-client
+          asset_name: rpclip-client-aarch64-linux-musl
+          asset_content_type: application/octet-stream
+
+# Anchors for repeated steps
+anchors:
+  cache_cargo_registry: &cache_cargo_registry
+    name: Cache Cargo Registry
+    uses: actions/cache@v3
+    with:
+      path: ~/.cargo/registry
+      key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+  cache_cargo_index: &cache_cargo_index
+    name: Cache Cargo Index
+    uses: actions/cache@v3
+    with:
+      path: ~/.cargo/index
+      key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+  cache_cargo_build: &cache_cargo_build
+    name: Cache Cargo Build
+    uses: actions/cache@v3
