@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 #[derive(Parser)]
 struct Args {
     #[arg(short, long, value_name = "IP:PORT", required = true)]
-    address: String,
+    address: Option<String>,
 }
 
 #[derive(Clone)]
@@ -51,7 +51,13 @@ async fn main() {
     env_logger::init();
     // Parse command line arguments
     let args = Args::parse();
-    let listen_addr: SocketAddr = args.address.parse().unwrap();
+    let listen_addr: SocketAddr = match args.address {
+        Some(addr) => addr.parse().expect("Invalid address"),
+        None => {
+            info!("No address provided, using default address");
+            "[::1]:6667".parse().expect("Invalid address")
+        }
+    };
 
     let listener = tarpc::serde_transport::tcp::listen(&listen_addr, Bincode::default)
         .await
