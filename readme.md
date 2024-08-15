@@ -33,7 +33,7 @@ cat something | rpclip-client--server 127.0.0.1:6667 get
 The `get` command fetches the current clipboard content from the server (local windows computer), and the `set` command updates the server's clipboard with the content piped into the client.
 
 ## Configuration
-The client supports configuration through a file. By default, it looks for config.toml in the system's configuration directory. The configuration file should specify the server address:
+The client supports configuration through a file. By default, it looks for `config.yaml` in the system's configuration directory. The configuration file should specify the server address:
 ```yaml
 server_addr: "127.0.0.1:6667"
 ```
