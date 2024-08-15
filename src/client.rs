@@ -27,8 +27,61 @@ struct Config {
     server_addr: String,
 }
 
+#[derive(Debug)]
+enum ListenAddr {
+    Tcp(SocketAddr),
+    #[cfg(unix)]
+    Unix(std::path::PathBuf),
+}
+
+impl From<String> for ListenAddr {
+    fn from(addr: String) -> Self {
+        match addr.parse() {
+            Ok(addr) => ListenAddr::Tcp(addr),
+            Err(_) => {
+                #[cfg(unix)]
+                {
+                    ListenAddr::Unix(addr.into())
+                }
+                #[cfg(not(unix))]
+                {
+                    error!("Unix domain sockets are not supported on this platform");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+async fn from_listen_addr(addr: ListenAddr) -> RpClipClient {
+    match addr {
+        ListenAddr::Tcp(addr) => RpClipClient::new(
+            client::Config::default(),
+            tarpc::serde_transport::tcp::connect(addr, Bincode::default)
+                .await
+                .unwrap_or_else(|e| {
+                    error!("Unable to connect to server: {}", e);
+                    std::process::exit(1);
+                }),
+        )
+        .spawn(),
+        #[cfg(unix)]
+        ListenAddr::Unix(path) => RpClipClient::new(
+            client::Config::default(),
+            tarpc::serde_transport::unix::connect(path, Bincode::default)
+                .await
+                .unwrap_or_else(|e| {
+                    error!("Unable to connect to server: {}", e);
+                    std::process::exit(1);
+                }),
+        )
+        .spawn(),
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    env_logger::init();
     let args = Args::parse();
     let server = match (args.server, args.config) {
         (Some(server), _) => {
@@ -58,15 +111,9 @@ async fn main() {
             }
         }
     };
-    let server: SocketAddr = server.parse().expect("Invalid server address");
-
-    let transport = tarpc::serde_transport::tcp::connect(server, Bincode::default);
-
-    let client = RpClipClient::new(
-        client::Config::default(),
-        transport.await.expect("Unable to connect"),
-    )
-    .spawn();
+    let server: ListenAddr = server.into();
+    info!("Connecting to server at {:?}", server);
+    let client = from_listen_addr(server).await;
 
     match &args.command {
         Commands::Get => {
