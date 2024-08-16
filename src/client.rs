@@ -8,7 +8,7 @@ use tarpc::{client, context, tokio_serde::formats::Bincode};
 
 #[derive(Parser)]
 struct Args {
-    #[clap(short, long, value_name = "IP:PORT")]
+    #[clap(short, long, value_name = "IP:PORT or UNIX SOCKET PATH")]
     server: Option<String>,
     #[clap(short, long)]
     config: Option<String>,
