@@ -23,11 +23,11 @@ Replace user@ssh_server with your SSH server's username and address. This comman
 ## Running the Client
 After setting up port forwarding, you can run the client on the SSH server to communicate with the local RpClip server. Navigate to the target/release directory and execute:
 ``` bash
-rpclip-client--server 127.0.0.1:6667 get
+rpclip-client get
 ```
 or
 ```bash
-cat something | rpclip-client--server 127.0.0.1:6667 get
+cat something | rpclip-client set
 ```
 
 The `get` command fetches the current clipboard content from the server (local windows computer), and the `set` command updates the server's clipboard with the content piped into the client.
