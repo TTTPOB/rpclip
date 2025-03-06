@@ -9,9 +9,10 @@ You can:
 2. download from release, choose the right arch and platform to download.
 
 ## Running the Server
-To run the server on a local Windows computer, open a command prompt or PowerShell window, navigate to the project's target/release directory, and execute:
-
-This command starts the server listening on all interfaces at port 6667. You can replace 0.0.0.0:6667 with your desired IP address and port.
+```pwsh
+rpclip-server --address '[::1]:6667'
+```
+Usally the server is running on your local Windows machine.
 
 ## Setting Up SSH Remote Port Forwarding
 To communicate with the server from a remote client through SSH, set up remote port forwarding. On your SSH client machine, run:
@@ -19,6 +20,24 @@ To communicate with the server from a remote client through SSH, set up remote p
 ssh -R 6667:localhost:6667 user@ssh_server
 ```
 Replace user@ssh_server with your SSH server's username and address. This command forwards the port 6667 from the SSH server to the local machine where the RpClip server is running.
+
+Note, you can also use unix socket to communicate with the server, just replace the address with the socket file path. This adds some security to the communication.
+
+You can also add the ssh host to your `~/.ssh/config` file so that you don't need to type the address every time:
+```bash
+Host ssh_server
+    HostName ssh_server
+    User user
+    RemoteForward 6667 localhost:6667
+```
+
+or (with the unix socket)
+```bash
+Host ssh_server
+    HostName ssh_server
+    User user
+    RemoteForward /tmp/rpclip.sock localhost:6667
+```
 
 ## Running the Client
 After setting up port forwarding, you can run the client on the SSH server to communicate with the local RpClip server. Navigate to the target/release directory and execute:
