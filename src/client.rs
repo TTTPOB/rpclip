@@ -1,4 +1,3 @@
-#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 use clap::{Parser, Subcommand};
 use log::{error, info, warn};
 use rpclip::RpClipClient;
