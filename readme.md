@@ -8,6 +8,11 @@ You can:
 1. `cargo install --git https://github.com/tttpob/rpclip.git`, this requires you have rust toolchain installed.
 2. download from release, choose the right arch and platform to download.
 
+### Or you are setting up linux client
+```bash
+bash <(curl -s https://raw.githubusercontent.com/tttpob/rpclip/refs/heads/master/install_linux_client.sh)
+```
+
 ## Running the Server
 ```pwsh
 rpclip-server --address '[::1]:6667'
