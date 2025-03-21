@@ -22,10 +22,14 @@ echo "Latest version: $LATEST_RELEASE"
 # Construct download URL
 DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_RELEASE/$ASSET_NAME"
 
+# Create temp working dir
+TMPDIR=$(mktemp -d)
+echo "Using temp directory: $TMPDIR"
+
 # Download binary
-curl -L "$DOWNLOAD_URL" -o /tmp/"$ASSET_NAME"
-chmod +x /tmp/"$ASSET_NAME"
-echo "Downloaded and set executable permissions on /tmp/$ASSET_NAME"
+curl -L "$DOWNLOAD_URL" -o "$TMPDIR/$ASSET_NAME"
+chmod +x "$TMPDIR/$ASSET_NAME"
+echo "Downloaded and set executable permissions on $TMPDIR/$ASSET_NAME"
 
 # Determine install path
 if [[ "$EUID" -eq 0 ]]; then
@@ -37,18 +41,21 @@ else
 fi
 
 # Move binary
-mv /tmp/"$ASSET_NAME" "$INSTALL_DIR/rpclip-client"
+mv "$TMPDIR/$ASSET_NAME" "$INSTALL_DIR/rpclip-client"
 echo "Moved $ASSET_NAME to $INSTALL_DIR/rpclip-client"
 
 # Create rpc and rpp wrapper scripts
 echo '#!/usr/bin/env bash
-rpclip-client set' > /tmp/rpc
-chmod +x /tmp/rpc
-mv /tmp/rpc "$INSTALL_DIR/rpc"
+rpclip-client set' > "$TMPDIR/rpc"
+chmod +x "$TMPDIR/rpc"
+mv "$TMPDIR/rpc" "$INSTALL_DIR/rpc"
 echo "Installed rpc script to $INSTALL_DIR/rpc"
 
 echo '#!/usr/bin/env bash
-rpclip-client get' > /tmp/rpp
-chmod +x /tmp/rpp
-mv /tmp/rpp "$INSTALL_DIR/rpp"
+rpclip-client get' > "$TMPDIR/rpp"
+chmod +x "$TMPDIR/rpp"
+mv "$TMPDIR/rpp" "$INSTALL_DIR/rpp"
 echo "Installed rpp script to $INSTALL_DIR/rpp"
+
+# Clean up temp dir
+rm -rf "$TMPDIR"
