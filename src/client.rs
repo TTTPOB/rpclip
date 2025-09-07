@@ -1,13 +1,12 @@
+use age::ssh;
+use age::{Decryptor, Encryptor};
 use clap::{Parser, Subcommand};
 use log::{error, info, warn};
 use rpclip::{AgeEncryptedBlob, RpClipClient};
 use serde::Deserialize;
+use std::str::FromStr;
 use std::{io::BufRead, net::SocketAddr};
 use tarpc::{client, context, tokio_serde::formats::Bincode};
-use std::str::FromStr;
-use std::io::Write as _; // for writer.finish()
-use age::{Encryptor, Decryptor};
-use age::ssh;
 
 #[derive(Parser)]
 struct Args {
@@ -99,35 +98,54 @@ fn expand_tilde(path: &str) -> String {
 
 fn read_pubkey_line(path: &str) -> Result<String, String> {
     let path = expand_tilde(path);
-    let content = std::fs::read_to_string(&path).map_err(|e| format!("read pubkey {}: {}", path, e))?;
-    let line = content.lines().next().ok_or_else(|| "empty pubkey file".to_string())?;
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("read pubkey {}: {}", path, e))?;
+    let line = content
+        .lines()
+        .next()
+        .ok_or_else(|| "empty pubkey file".to_string())?;
     Ok(line.trim().to_string())
 }
 
 fn encrypt_to_pubkey_line(pubkey_line: &str, plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    let recipient = ssh::Recipient::from_str(pubkey_line).map_err(|e| format!("invalid recipient: {:?}", e))?;
+    let recipient =
+        ssh::Recipient::from_str(pubkey_line).map_err(|e| format!("invalid recipient: {:?}", e))?;
     let recipients: Vec<&dyn age::Recipient> = vec![&recipient as &dyn age::Recipient];
-    let encryptor = Encryptor::with_recipients(recipients.into_iter()).map_err(|e| format!("encryptor: {}", e))?;
+    let encryptor = Encryptor::with_recipients(recipients.into_iter())
+        .map_err(|e| format!("encryptor: {}", e))?;
     let mut out = Vec::new();
-    let mut writer = encryptor.wrap_output(&mut out).map_err(|e| format!("wrap_output: {}", e))?;
+    let mut writer = encryptor
+        .wrap_output(&mut out)
+        .map_err(|e| format!("wrap_output: {}", e))?;
     use std::io::Write;
-    writer.write_all(plaintext).map_err(|e| format!("write: {}", e))?;
+    writer
+        .write_all(plaintext)
+        .map_err(|e| format!("write: {}", e))?;
     writer.finish().map_err(|e| format!("finish: {}", e))?;
     Ok(out)
 }
 
-fn decrypt_with_private_key_path(private_key_path: &str, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+fn decrypt_with_private_key_path(
+    private_key_path: &str,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, String> {
     let private_key_path = expand_tilde(private_key_path);
-    let key_bytes = std::fs::read(&private_key_path).map_err(|e| format!("read key {}: {}", private_key_path, e))?;
-    let identity = ssh::Identity::from_buffer(std::io::Cursor::new(key_bytes), Some(private_key_path.clone()))
-        .map_err(|e| format!("identity parse: {:?}", e))?;
+    let key_bytes = std::fs::read(&private_key_path)
+        .map_err(|e| format!("read key {}: {}", private_key_path, e))?;
+    let identity = ssh::Identity::from_buffer(
+        std::io::Cursor::new(key_bytes),
+        Some(private_key_path.clone()),
+    )
+    .map_err(|e| format!("identity parse: {:?}", e))?;
     let decryptor = Decryptor::new(ciphertext).map_err(|e| format!("decryptor: {}", e))?;
     let mut reader = decryptor
         .decrypt(std::iter::once(&identity as &dyn age::Identity))
         .map_err(|e| format!("decrypt: {}", e))?;
     use std::io::Read;
     let mut plaintext = Vec::new();
-    reader.read_to_end(&mut plaintext).map_err(|e| format!("read: {}", e))?;
+    reader
+        .read_to_end(&mut plaintext)
+        .map_err(|e| format!("read: {}", e))?;
     Ok(plaintext)
 }
 
@@ -247,7 +265,10 @@ async fn main() {
                 }
             };
 
-            let blob = AgeEncryptedBlob { ver: 1, data: ciphertext };
+            let blob = AgeEncryptedBlob {
+                ver: 1,
+                data: ciphertext,
+            };
             client.set_clip(context::current(), blob).await.unwrap();
         }
     }

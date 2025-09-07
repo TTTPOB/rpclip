@@ -1,8 +1,11 @@
+use age::ssh;
+use age::{Decryptor, Encryptor};
 use arboard::Clipboard;
 use clap::Parser;
 use futures::prelude::*;
 use log::{error, info};
 use rpclip::{AgeEncryptedBlob, RpClip};
+use std::str::FromStr;
 use std::{net::SocketAddr, sync::Arc};
 use tarpc::{
     context,
@@ -10,10 +13,6 @@ use tarpc::{
     tokio_serde::formats::Bincode,
 };
 use tokio::sync::Mutex;
-use std::str::FromStr;
-use age::{Encryptor, Decryptor};
-use age::ssh;
-use std::io::Write as _;
 
 #[derive(Parser)]
 struct Args {
@@ -31,7 +30,11 @@ struct RpClipServer {
 }
 
 impl RpClip for RpClipServer {
-    async fn get_clip(self, _: context::Context, client_ssh_pubkey_line: String) -> AgeEncryptedBlob {
+    async fn get_clip(
+        self,
+        _: context::Context,
+        client_ssh_pubkey_line: String,
+    ) -> AgeEncryptedBlob {
         let text = match self.clipboard.lock().await.get_text() {
             Ok(text) => {
                 info!("server got clipboard text (len={} bytes)", text.len());
@@ -48,7 +51,10 @@ impl RpClip for RpClipServer {
             Ok(r) => r,
             Err(e) => {
                 error!("invalid client ssh pubkey: {:?}", e);
-                return AgeEncryptedBlob { ver: 1, data: Vec::new() };
+                return AgeEncryptedBlob {
+                    ver: 1,
+                    data: Vec::new(),
+                };
             }
         };
         let recipients: Vec<&dyn age::Recipient> = vec![&recipient as &dyn age::Recipient];
@@ -56,7 +62,10 @@ impl RpClip for RpClipServer {
             Ok(e) => e,
             Err(e) => {
                 error!("encryptor error: {}", e);
-                return AgeEncryptedBlob { ver: 1, data: Vec::new() };
+                return AgeEncryptedBlob {
+                    ver: 1,
+                    data: Vec::new(),
+                };
             }
         };
         let mut out = Vec::new();
@@ -88,7 +97,10 @@ impl RpClip for RpClipServer {
                 return;
             }
         };
-        let identity = match ssh::Identity::from_buffer(std::io::Cursor::new(key_bytes), Some(key_path.clone())) {
+        let identity = match ssh::Identity::from_buffer(
+            std::io::Cursor::new(key_bytes),
+            Some(key_path.clone()),
+        ) {
             Ok(i) => i,
             Err(e) => {
                 error!("failed to parse ssh identity {}: {:?}", key_path, e);
@@ -173,7 +185,10 @@ async fn main() {
         .filter_map(|r| future::ready(r.ok()))
         .map(server::BaseChannel::with_defaults)
         .map(|channel| {
-            let rpserver = RpClipServer { clipboard: clipboard.clone(), ssh_key_path: ssh_key_path.clone() };
+            let rpserver = RpClipServer {
+                clipboard: clipboard.clone(),
+                ssh_key_path: ssh_key_path.clone(),
+            };
             channel.execute(rpserver.serve()).for_each(|x| async {
                 tokio::spawn(x);
                 info!("New client connected");
