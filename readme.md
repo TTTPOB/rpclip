@@ -1,12 +1,12 @@
 # RpClip
 
-RpClip is a Rust-based clipboard synchronization tool that allows you to share clipboard content between a server and a client over a network. This document provides instructions on how to use the RpClip server and client, including an example of running the server on a local Windows computer and the client on an SSH server, communicating through SSH remote port forwarding.
+RpClip is a Rust-based clipboard synchronization tool that lets you share clipboard content between a server and a client over a network. Traffic is end‑to‑end encrypted using age with SSH keys. This doc shows how to run the server/client and use SSH remote port forwarding.
 
 ## Install
 
 You can:
-1. `cargo install --git https://github.com/tttpob/rpclip.git`, this requires you have rust toolchain installed.
-2. download from release, choose the right arch and platform to download.
+1. `cargo install --git https://github.com/tttpob/rpclip.git` (requires Rust toolchain)
+2. Download from Releases for your arch/platform
 
 ### Or you are setting up linux client
 ```bash
@@ -17,7 +17,7 @@ bash <(curl -s https://raw.githubusercontent.com/tttpob/rpclip/refs/heads/master
 ```pwsh
 rpclip-server --address '[::1]:6667'
 ```
-Usally the server is running on your local Windows machine.
+Usually the server runs on your local Windows machine. The server uses `~/.ssh/id_ed25519` by default to decrypt incoming data; override with `--ssh-key-path <PATH>` if needed.
 
 ## Setting Up SSH Remote Port Forwarding
 To communicate with the server from a remote client through SSH, set up remote port forwarding. On your SSH client machine, run:
@@ -57,8 +57,15 @@ cat something | rpclip-client set
 The `get` command fetches the current clipboard content from the server (local windows computer), and the `set` command updates the server's clipboard with the content piped into the client.
 
 ## Configuration
-The client supports configuration through a file. By default, it looks for `config.yaml` in the system's configuration directory. The configuration file should specify the server address:
+The client supports configuration through a file. By default it loads `~/.config/rpclip/config.yaml` (or pass `--config <PATH>`). The configuration should specify the server address and, for encryption, SSH key details:
 ```yaml
-server_addr: "127.0.0.1:6667"
+server_addr: "127.0.0.1:6667"    # or a UNIX socket path on Linux
+# Optional: client key paths used for `get` (defaults shown)
+ssh_key_path: "~/.ssh/id_ed25519"
+ssh_pubkey_path: "~/.ssh/id_ed25519.pub"
+# Required for `set`: server's SSH public key (OpenSSH one-line format)
+server_ssh_pubkey: "ssh-ed25519 AAAAC3... user@host"
 ```
-If the configuration file exists and no server address is provided through the command line, the client uses the address from the configuration file.
+You can also pass `--server <IP:PORT or UNIX SOCKET PATH>` to override `server_addr`. If neither flag nor config is provided, the client uses `127.0.0.1:6667`.
+
+If you used the Linux installer script, wrapper commands are available: `rpc` (send/set) and `rpp` (receive/get).
