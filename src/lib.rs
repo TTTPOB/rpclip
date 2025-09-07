@@ -1,8 +1,19 @@
 use tarpc;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgeEncryptedBlob {
+    pub ver: u8,
+    pub data: Vec<u8>,
+}
+
 #[tarpc::service]
 pub trait RpClip {
-    async fn get_clip() -> String;
-    async fn set_clip(text: String);
+    // Client provides its OpenSSH public key line; server returns age-encrypted bytes
+    async fn get_clip(client_ssh_pubkey_line: String) -> AgeEncryptedBlob;
+
+    // Client sends ciphertext encrypted for the server
+    async fn set_clip(blob: AgeEncryptedBlob);
 }
 
 pub mod line_end {

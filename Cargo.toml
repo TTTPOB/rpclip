@@ -14,6 +14,7 @@ serde = { version = "1.0.204", features = ["derive"] }
 serde_yaml = "0.9.34"
 tarpc = { version = "0.34.0", features = ["full"] }
 tokio = { version = "1.38.1", features = ["full"] }
+age = { version = "0.11", features = ["ssh"] }
 
 [[bin]]
 name = "rpclip-server"
