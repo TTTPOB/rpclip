@@ -1,6 +1,20 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u8 = 2;
+pub mod auth;
+
+pub const PROTOCOL_VERSION: u8 = 3;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Challenge {
+    pub ver: u8,
+    pub nonce: [u8; 32],
+}
+
+impl Challenge {
+    pub fn validate_version(&self) -> Result<(), String> {
+        validate_version(self.ver)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgeEncryptedBlob {
@@ -10,24 +24,63 @@ pub struct AgeEncryptedBlob {
 
 impl AgeEncryptedBlob {
     pub fn validate_version(&self) -> Result<(), String> {
-        if self.ver == PROTOCOL_VERSION {
-            Ok(())
-        } else {
-            Err(format!(
-                "unsupported protocol version {}; expected {}",
-                self.ver, PROTOCOL_VERSION
-            ))
-        }
+        validate_version(self.ver)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthRequest {
+    pub ver: u8,
+    pub client_ssh_pubkey: String,
+    pub challenge: Challenge,
+    pub signature: String,
+}
+
+impl AuthRequest {
+    pub fn validate_version(&self) -> Result<(), String> {
+        validate_version(self.ver)?;
+        self.challenge.validate_version()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetRequest {
+    pub auth: AuthRequest,
+    pub blob: AgeEncryptedBlob,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedClipboard {
+    pub ver: u8,
+    pub blob: AgeEncryptedBlob,
+    pub signature: String,
+}
+
+impl SignedClipboard {
+    pub fn validate_version(&self) -> Result<(), String> {
+        validate_version(self.ver)?;
+        self.blob.validate_version()
+    }
+}
+
+fn validate_version(version: u8) -> Result<(), String> {
+    if version == PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(format!(
+            "unsupported protocol version {}; expected {}",
+            version, PROTOCOL_VERSION
+        ))
     }
 }
 
 #[tarpc::service]
 pub trait RpClip {
-    // Client provides its OpenSSH public key line; server returns age-encrypted bytes
-    async fn get_clip(client_ssh_pubkey_line: String) -> Result<AgeEncryptedBlob, String>;
+    async fn issue_challenge(client_ssh_pubkey_line: String) -> Result<Challenge, String>;
 
-    // Client sends ciphertext encrypted for the server
-    async fn set_clip(blob: AgeEncryptedBlob) -> Result<(), String>;
+    async fn get_clip(auth: AuthRequest) -> Result<SignedClipboard, String>;
+
+    async fn set_clip(request: SetRequest) -> Result<(), String>;
 }
 
 pub mod line_end {

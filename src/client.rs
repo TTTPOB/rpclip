@@ -2,9 +2,12 @@ use age::ssh;
 use age::{Decryptor, Encryptor};
 use clap::{Parser, Subcommand};
 use log::{error, info, warn};
-use rpclip::{AgeEncryptedBlob, RpClipClient, PROTOCOL_VERSION};
+use rpclip::auth;
+use rpclip::{AgeEncryptedBlob, Challenge, RpClipClient, SetRequest, PROTOCOL_VERSION};
 use serde::Deserialize;
+use ssh_key::{PrivateKey, PublicKey};
 use std::future::Future;
+use std::path::Path;
 use std::str::FromStr;
 use tarpc::{client, context, tokio_serde::formats::Bincode};
 
@@ -42,6 +45,14 @@ enum ListenAddr {
     Tcp(String),
     #[cfg(unix)]
     Unix(std::path::PathBuf),
+}
+
+struct ClientCredentials {
+    private_key_path: String,
+    private_key: PrivateKey,
+    public_key_line: String,
+    server_public_key_line: String,
+    server_public_key: PublicKey,
 }
 
 fn parse_listen_addr(addr: String) -> Result<ListenAddr, String> {
@@ -139,6 +150,51 @@ fn read_pubkey_line(path: &str) -> Result<String, String> {
         .next()
         .ok_or_else(|| "empty pubkey file".to_string())?;
     Ok(line.trim().to_string())
+}
+
+fn load_client_credentials(config: Option<&Config>) -> Result<ClientCredentials, String> {
+    let private_key_path = expand_tilde(
+        &config
+            .and_then(|config| config.ssh_key_path.clone())
+            .unwrap_or_else(|| "~/.ssh/id_ed25519".to_string()),
+    );
+    let public_key_path = config
+        .and_then(|config| config.ssh_pubkey_path.clone())
+        .unwrap_or_else(|| "~/.ssh/id_ed25519.pub".to_string());
+    let public_key_line = read_pubkey_line(&public_key_path)?;
+    let public_key = auth::parse_public_key(&public_key_line)?;
+    let private_key = auth::read_private_key(Path::new(&private_key_path))?;
+    if private_key.public_key().key_data() != public_key.key_data() {
+        return Err("client SSH private and public keys do not match".to_string());
+    }
+
+    let server_public_key_line = config
+        .and_then(|config| config.server_ssh_pubkey.clone())
+        .ok_or_else(|| "server_ssh_pubkey is required in client config".to_string())?;
+    let server_public_key = auth::parse_public_key(&server_public_key_line)
+        .map_err(|e| format!("invalid server_ssh_pubkey: {e}"))?;
+
+    Ok(ClientCredentials {
+        private_key_path,
+        private_key,
+        public_key_line,
+        server_public_key_line,
+        server_public_key,
+    })
+}
+
+async fn issue_challenge(
+    client: &RpClipClient,
+    client_public_key_line: String,
+) -> Result<Challenge, String> {
+    let challenge = client
+        .issue_challenge(context::current(), client_public_key_line)
+        .await
+        .map_err(|e| format!("challenge RPC failed: {e}"))??;
+    challenge
+        .validate_version()
+        .map_err(|e| format!("server returned incompatible challenge: {e}"))?;
+    Ok(challenge)
 }
 
 fn encrypt_to_pubkey_line(pubkey_line: &str, plaintext: &[u8]) -> Result<Vec<u8>, String> {
@@ -239,29 +295,36 @@ async fn main() {
             cfg = serde_yaml::from_str(&content).ok();
         }
     }
+    let credentials = load_client_credentials(cfg.as_ref()).unwrap_or_else(|e| {
+        error!("Failed to load client authentication credentials: {e}");
+        std::process::exit(1);
+    });
 
     match &args.command {
         Commands::Get => {
-            // Determine our public and private key paths
-            let ssh_priv = cfg
-                .as_ref()
-                .and_then(|c| c.ssh_key_path.clone())
-                .unwrap_or_else(|| "~/.ssh/id_ed25519".to_string());
-            let ssh_pub = cfg
-                .as_ref()
-                .and_then(|c| c.ssh_pubkey_path.clone())
-                .unwrap_or_else(|| "~/.ssh/id_ed25519.pub".to_string());
+            let challenge =
+                match issue_challenge(&client, credentials.public_key_line.clone()).await {
+                    Ok(challenge) => challenge,
+                    Err(e) => {
+                        error!("Server refused authentication challenge: {e}");
+                        std::process::exit(1);
+                    }
+                };
+            let auth_request = auth::sign_get_request(
+                &credentials.private_key,
+                credentials.public_key_line.clone(),
+                challenge,
+            )
+            .unwrap_or_else(|e| {
+                error!("Failed to sign get request: {e}");
+                std::process::exit(1);
+            });
 
-            let pubkey_line = match read_pubkey_line(&ssh_pub) {
-                Ok(l) => l,
-                Err(e) => {
-                    error!("Failed to read SSH public key: {}", e);
-                    std::process::exit(1);
-                }
-            };
-
-            let blob = match client.get_clip(context::current(), pubkey_line).await {
-                Ok(Ok(blob)) => blob,
+            let response = match client
+                .get_clip(context::current(), auth_request.clone())
+                .await
+            {
+                Ok(Ok(response)) => response,
                 Ok(Err(e)) => {
                     error!("Server failed to get clipboard: {}", e);
                     std::process::exit(1);
@@ -271,12 +334,17 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            if let Err(e) = blob.validate_version() {
-                error!("Server returned incompatible clipboard data: {}", e);
+            if let Err(e) =
+                auth::verify_get_response(&credentials.server_public_key, &auth_request, &response)
+            {
+                error!("Server clipboard response failed authentication: {e}");
                 std::process::exit(1);
             }
 
-            let plaintext = match decrypt_with_private_key_path(&ssh_priv, &blob.data) {
+            let plaintext = match decrypt_with_private_key_path(
+                &credentials.private_key_path,
+                &response.blob.data,
+            ) {
                 Ok(p) => p,
                 Err(e) => {
                     error!("Failed to decrypt clipboard: {}", e);
@@ -295,16 +363,10 @@ async fn main() {
                 std::process::exit(1);
             }
 
-            // Load server recipient from config
-            let server_recipient = cfg
-                .as_ref()
-                .and_then(|c| c.server_ssh_pubkey.clone())
-                .unwrap_or_else(|| {
-                    error!("server_ssh_pubkey is required in config for 'set'");
-                    std::process::exit(1);
-                });
-
-            let ciphertext = match encrypt_to_pubkey_line(&server_recipient, text.as_bytes()) {
+            let ciphertext = match encrypt_to_pubkey_line(
+                &credentials.server_public_key_line,
+                text.as_bytes(),
+            ) {
                 Ok(c) => c,
                 Err(e) => {
                     error!("Failed to encrypt for server: {}", e);
@@ -316,7 +378,29 @@ async fn main() {
                 ver: PROTOCOL_VERSION,
                 data: ciphertext,
             };
-            match client.set_clip(context::current(), blob).await {
+            let challenge =
+                match issue_challenge(&client, credentials.public_key_line.clone()).await {
+                    Ok(challenge) => challenge,
+                    Err(e) => {
+                        error!("Server refused authentication challenge: {e}");
+                        std::process::exit(1);
+                    }
+                };
+            let auth_request = auth::sign_set_request(
+                &credentials.private_key,
+                credentials.public_key_line.clone(),
+                challenge,
+                &blob,
+            )
+            .unwrap_or_else(|e| {
+                error!("Failed to sign set request: {e}");
+                std::process::exit(1);
+            });
+            let request = SetRequest {
+                auth: auth_request,
+                blob,
+            };
+            match client.set_clip(context::current(), request).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     error!("Server failed to set clipboard: {}", e);

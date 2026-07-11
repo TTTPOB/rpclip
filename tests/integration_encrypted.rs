@@ -4,8 +4,13 @@ use std::time::Duration;
 use age::ssh;
 use age::{Decryptor, Encryptor};
 use futures::StreamExt;
-use rpclip::{AgeEncryptedBlob, RpClip, RpClipClient, PROTOCOL_VERSION};
+use rpclip::auth::{self, AuthorizedClients, ChallengeStore};
+use rpclip::{
+    AgeEncryptedBlob, AuthRequest, Challenge, RpClip, RpClipClient, SetRequest, SignedClipboard,
+    PROTOCOL_VERSION,
+};
 use ssh_key::{Algorithm, LineEnding, PrivateKey};
+use std::sync::Arc;
 use tarpc::server::Channel;
 use tarpc::{client, context, tokio_serde::formats::Bincode};
 use tokio::task::JoinHandle;
@@ -29,17 +34,36 @@ impl TestClipboard {
 struct TestServer {
     clipboard: TestClipboard,
     ssh_key_path: String,
+    private_key: Arc<PrivateKey>,
+    authorized_clients: Arc<AuthorizedClients>,
+    challenges: Arc<ChallengeStore>,
 }
 
 impl RpClip for TestServer {
-    async fn get_clip(
+    async fn issue_challenge(
         self,
         _: context::Context,
         client_ssh_pubkey_line: String,
-    ) -> Result<AgeEncryptedBlob, String> {
+    ) -> Result<Challenge, String> {
+        let public_key = auth::parse_public_key(&client_ssh_pubkey_line)?;
+        self.authorized_clients.authorize(&public_key)?;
+        self.challenges.issue(&public_key)
+    }
+
+    async fn get_clip(
+        self,
+        _: context::Context,
+        auth_request: AuthRequest,
+    ) -> Result<SignedClipboard, String> {
+        let public_key = auth::parse_public_key(&auth_request.client_ssh_pubkey)?;
+        self.authorized_clients.authorize(&public_key)?;
+        auth::verify_get_request(&public_key, &auth_request)?;
+        self.challenges
+            .consume(&auth_request.challenge, &public_key)?;
+
         let text = self.clipboard.get_text().await;
         let recipient =
-            ssh::Recipient::from_str(&client_ssh_pubkey_line).expect("client pubkey parse");
+            ssh::Recipient::from_str(&auth_request.client_ssh_pubkey).expect("client pubkey parse");
         let recipients: Vec<&dyn age::Recipient> = vec![&recipient as &dyn age::Recipient];
         let encryptor = Encryptor::with_recipients(recipients.into_iter()).expect("encryptor");
         let mut out = Vec::new();
@@ -47,14 +71,20 @@ impl RpClip for TestServer {
         use std::io::Write;
         writer.write_all(text.as_bytes()).expect("write");
         writer.finish().expect("finish");
-        Ok(AgeEncryptedBlob {
+        let blob = AgeEncryptedBlob {
             ver: PROTOCOL_VERSION,
             data: out,
-        })
+        };
+        auth::sign_get_response(&self.private_key, &auth_request, blob)
     }
 
-    async fn set_clip(self, _: context::Context, blob: AgeEncryptedBlob) -> Result<(), String> {
-        blob.validate_version()?;
+    async fn set_clip(self, _: context::Context, request: SetRequest) -> Result<(), String> {
+        let public_key = auth::parse_public_key(&request.auth.client_ssh_pubkey)?;
+        self.authorized_clients.authorize(&public_key)?;
+        auth::verify_set_request(&public_key, &request.auth, &request.blob)?;
+        self.challenges
+            .consume(&request.auth.challenge, &public_key)?;
+        request.blob.validate_version()?;
 
         let key_bytes = std::fs::read(&self.ssh_key_path).expect("read server key");
         let identity = ssh::Identity::from_buffer(
@@ -62,7 +92,7 @@ impl RpClip for TestServer {
             Some(self.ssh_key_path.clone()),
         )
         .expect("identity parse");
-        let decryptor = Decryptor::new(&blob.data[..]).expect("decryptor");
+        let decryptor = Decryptor::new(&request.blob.data[..]).expect("decryptor");
         let mut reader = decryptor
             .decrypt(std::iter::once(&identity as &dyn age::Identity))
             .expect("decrypt");
@@ -80,6 +110,8 @@ impl RpClip for TestServer {
 async fn start_test_server(
     addr: std::net::SocketAddr,
     ssh_key_path: String,
+    private_key: Arc<PrivateKey>,
+    authorized_clients: Arc<AuthorizedClients>,
     clipboard: TestClipboard,
 ) -> JoinHandle<()> {
     let listener = tarpc::serde_transport::tcp::listen(&addr, Bincode::default)
@@ -93,6 +125,9 @@ async fn start_test_server(
                 let rpserver = TestServer {
                     clipboard: clipboard.clone(),
                     ssh_key_path: ssh_key_path.clone(),
+                    private_key: private_key.clone(),
+                    authorized_clients: authorized_clients.clone(),
+                    challenges: Arc::new(ChallengeStore::default()),
                 };
                 channel.execute(rpserver.serve()).for_each(|x| async {
                     tokio::spawn(x);
@@ -123,6 +158,20 @@ async fn encrypted_round_trip() {
     let td = tempfile::tempdir().expect("tempdir");
     let (server_key_path, server_pub_line) = gen_ssh_keypair(td.path(), "server_id_ed25519");
     let (client_key_path, client_pub_line) = gen_ssh_keypair(td.path(), "client_id_ed25519");
+    let client_private_key =
+        PrivateKey::read_openssh_file(std::path::Path::new(&client_key_path)).expect("client key");
+    let server_private_key = Arc::new(
+        PrivateKey::read_openssh_file(std::path::Path::new(&server_key_path)).expect("server key"),
+    );
+    let authorized_keys_path = td.path().join("authorized_keys");
+    std::fs::write(
+        &authorized_keys_path,
+        format!("{client_pub_line} integration client\n"),
+    )
+    .expect("write authorized keys");
+    let authorized_clients = Arc::new(
+        AuthorizedClients::read_file(&authorized_keys_path).expect("read authorized clients"),
+    );
 
     // Random port
     let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 0");
@@ -131,7 +180,14 @@ async fn encrypted_round_trip() {
 
     // Start server
     let clipboard = TestClipboard::new();
-    let _server_handle = start_test_server(addr, server_key_path.clone(), clipboard.clone()).await;
+    let _server_handle = start_test_server(
+        addr,
+        server_key_path.clone(),
+        server_private_key.clone(),
+        authorized_clients,
+        clipboard.clone(),
+    )
+    .await;
 
     // Connect client
     let client = RpClipClient::new(
@@ -156,8 +212,26 @@ async fn encrypted_round_trip() {
         ver: PROTOCOL_VERSION,
         data: out,
     };
+    let challenge = client
+        .issue_challenge(context::current(), client_pub_line.clone())
+        .await
+        .expect("challenge RPC")
+        .expect("challenge");
+    let set_auth = auth::sign_set_request(
+        &client_private_key,
+        client_pub_line.clone(),
+        challenge,
+        &blob,
+    )
+    .expect("sign set request");
     client
-        .set_clip(context::current(), blob)
+        .set_clip(
+            context::current(),
+            SetRequest {
+                auth: set_auth,
+                blob,
+            },
+        )
         .await
         .expect("set_clip RPC")
         .expect("server set_clip");
@@ -166,11 +240,21 @@ async fn encrypted_round_trip() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Request get encrypted to client key and decrypt
-    let blob = client
-        .get_clip(context::current(), client_pub_line.clone())
+    let challenge = client
+        .issue_challenge(context::current(), client_pub_line.clone())
+        .await
+        .expect("challenge RPC")
+        .expect("challenge");
+    let get_auth = auth::sign_get_request(&client_private_key, client_pub_line.clone(), challenge)
+        .expect("sign get request");
+    let response = client
+        .get_clip(context::current(), get_auth.clone())
         .await
         .expect("get_clip RPC")
         .expect("server get_clip");
+    let server_public_key = auth::parse_public_key(&server_pub_line).expect("server public key");
+    auth::verify_get_response(&server_public_key, &get_auth, &response)
+        .expect("verify server response");
 
     let key_bytes = std::fs::read(&client_key_path).expect("read client key");
     let identity = ssh::Identity::from_buffer(
@@ -178,7 +262,7 @@ async fn encrypted_round_trip() {
         Some(client_key_path.clone()),
     )
     .expect("identity parse");
-    let decryptor = Decryptor::new(&blob.data[..]).expect("decryptor");
+    let decryptor = Decryptor::new(&response.blob.data[..]).expect("decryptor");
     let mut reader = decryptor
         .decrypt(std::iter::once(&identity as &dyn age::Identity))
         .expect("decrypt");

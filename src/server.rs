@@ -4,10 +4,15 @@ use arboard::Clipboard;
 use clap::Parser;
 use futures::prelude::*;
 use log::{error, info};
-use rpclip::{AgeEncryptedBlob, RpClip, PROTOCOL_VERSION};
+use rpclip::auth::{self, AuthorizedClients, ChallengeStore, CHALLENGE_TTL};
+use rpclip::{
+    AgeEncryptedBlob, AuthRequest, Challenge, RpClip, SetRequest, SignedClipboard, PROTOCOL_VERSION,
+};
+use ssh_key::{PrivateKey, PublicKey};
 use std::str::FromStr;
 use std::{
     net::SocketAddr,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 use tarpc::{
@@ -23,36 +28,81 @@ struct Args {
     /// Path to server's SSH private key (OpenSSH format). Defaults to ~/.ssh/id_ed25519
     #[arg(long)]
     ssh_key_path: Option<String>,
+    /// OpenSSH authorized_keys file. Defaults to ~/.ssh/authorized_keys
+    #[arg(long)]
+    authorized_keys_path: Option<String>,
 }
 
 #[derive(Clone)]
 struct RpClipServer {
     clipboard: Arc<Mutex<Clipboard>>,
     ssh_key_path: String,
+    private_key: Arc<PrivateKey>,
+    authorized_clients: Arc<AuthorizedClients>,
+    challenges: Arc<ChallengeStore>,
 }
 
 impl RpClip for RpClipServer {
-    async fn get_clip(
+    async fn issue_challenge(
         self,
         _: context::Context,
         client_ssh_pubkey_line: String,
-    ) -> Result<AgeEncryptedBlob, String> {
-        let clipboard = self.clipboard.clone();
-        tokio::task::spawn_blocking(move || encrypt_clipboard(clipboard, client_ssh_pubkey_line))
-            .await
-            .map_err(|e| format!("clipboard worker failed: {e}"))?
+    ) -> Result<Challenge, String> {
+        let public_key = self.authorize_client(&client_ssh_pubkey_line)?;
+        self.challenges.issue(&public_key)
     }
 
-    async fn set_clip(self, _: context::Context, blob: AgeEncryptedBlob) -> Result<(), String> {
-        blob.validate_version()?;
+    async fn get_clip(
+        self,
+        _: context::Context,
+        auth_request: AuthRequest,
+    ) -> Result<SignedClipboard, String> {
+        let public_key = self.authenticate_get(&auth_request)?;
+        self.challenges
+            .consume(&auth_request.challenge, &public_key)?;
+
+        let clipboard = self.clipboard.clone();
+        let private_key = self.private_key.clone();
+        tokio::task::spawn_blocking(move || {
+            let blob = encrypt_clipboard(clipboard, auth_request.client_ssh_pubkey.clone())?;
+            auth::sign_get_response(&private_key, &auth_request, blob)
+        })
+        .await
+        .map_err(|e| format!("clipboard worker failed: {e}"))?
+    }
+
+    async fn set_clip(self, _: context::Context, request: SetRequest) -> Result<(), String> {
+        let public_key = self.authenticate_set(&request)?;
+        self.challenges
+            .consume(&request.auth.challenge, &public_key)?;
 
         let clipboard = self.clipboard.clone();
         let ssh_key_path = self.ssh_key_path.clone();
         tokio::task::spawn_blocking(move || {
-            decrypt_and_set_clipboard(clipboard, ssh_key_path, blob)
+            decrypt_and_set_clipboard(clipboard, ssh_key_path, request.blob)
         })
         .await
         .map_err(|e| format!("clipboard worker failed: {e}"))?
+    }
+}
+
+impl RpClipServer {
+    fn authorize_client(&self, public_key_line: &str) -> Result<PublicKey, String> {
+        let public_key = auth::parse_public_key(public_key_line)?;
+        self.authorized_clients.authorize(&public_key)?;
+        Ok(public_key)
+    }
+
+    fn authenticate_get(&self, request: &AuthRequest) -> Result<PublicKey, String> {
+        let public_key = self.authorize_client(&request.client_ssh_pubkey)?;
+        auth::verify_get_request(&public_key, request)?;
+        Ok(public_key)
+    }
+
+    fn authenticate_set(&self, request: &SetRequest) -> Result<PublicKey, String> {
+        let public_key = self.authorize_client(&request.auth.client_ssh_pubkey)?;
+        auth::verify_set_request(&public_key, &request.auth, &request.blob)?;
+        Ok(public_key)
     }
 }
 
@@ -187,11 +237,38 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
+fn load_server_security(
+    ssh_key_path: Option<String>,
+    authorized_keys_path: Option<String>,
+) -> Result<(String, Arc<PrivateKey>, Arc<AuthorizedClients>), String> {
+    let ssh_key_path =
+        expand_tilde(&ssh_key_path.unwrap_or_else(|| "~/.ssh/id_ed25519".to_string()));
+    let authorized_keys_path = PathBuf::from(expand_tilde(
+        &authorized_keys_path.unwrap_or_else(|| "~/.ssh/authorized_keys".to_string()),
+    ));
+    let private_key = auth::read_private_key(PathBuf::from(&ssh_key_path).as_path())?;
+    let authorized_clients = AuthorizedClients::read_file(&authorized_keys_path)?;
+    info!(
+        "Loaded client authorization keys from {}",
+        authorized_keys_path.display()
+    );
+    Ok((
+        ssh_key_path,
+        Arc::new(private_key),
+        Arc::new(authorized_clients),
+    ))
+}
+
 #[tokio::main]
 async fn main() {
     env_logger::init();
     // Parse command line arguments
     let args = Args::parse();
+    let (ssh_key_path, private_key, authorized_clients) =
+        load_server_security(args.ssh_key_path, args.authorized_keys_path).unwrap_or_else(|e| {
+            error!("Unable to initialize server authentication: {e}");
+            std::process::exit(1);
+        });
     let mut listeners = Vec::with_capacity(args.address.len());
     for listen_addr in args.address {
         let listener = tarpc::serde_transport::tcp::listen(&listen_addr, Bincode::default)
@@ -207,9 +284,7 @@ async fn main() {
             .expect("clipboard worker failed")
             .expect("failed to initialize system clipboard"),
     ));
-    let ssh_key_path = args
-        .ssh_key_path
-        .unwrap_or_else(|| "~/.ssh/id_ed25519".to_string());
+    let challenges = Arc::new(ChallengeStore::new(CHALLENGE_TTL));
     info!("Clipboard server started");
     futures::stream::select_all(listeners)
         .filter_map(|result| {
@@ -226,6 +301,9 @@ async fn main() {
             let rpserver = RpClipServer {
                 clipboard: clipboard.clone(),
                 ssh_key_path: ssh_key_path.clone(),
+                private_key: private_key.clone(),
+                authorized_clients: authorized_clients.clone(),
+                challenges: challenges.clone(),
             };
             channel.execute(rpserver.serve()).for_each(|x| async {
                 tokio::spawn(x);
@@ -251,6 +329,8 @@ mod tests {
             "127.0.0.1:6667",
             "--address",
             "[::1]:6667",
+            "--authorized-keys-path",
+            "authorized_keys",
         ])
         .unwrap();
 
