@@ -10,7 +10,7 @@ You can:
 
 ### Or you are setting up linux client
 ```bash
-bash <(curl -s https://raw.githubusercontent.com/tttpob/rpclip/refs/heads/master/install_linux_client.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/tttpob/rpclip/refs/heads/master/install_linux_client.sh)
 ```
 
 ## Running the Server

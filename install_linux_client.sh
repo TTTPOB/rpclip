@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 # GitHub repository details
 REPO="tttpob/rpclip"
@@ -16,7 +17,10 @@ else
 fi
 
 # Get latest release version from GitHub API
-LATEST_RELEASE=$(curl -s https://api.github.com/repos/$REPO/releases/latest | jq -r '.tag_name')
+LATEST_RELEASE=$(
+    curl --fail --silent --show-error "https://api.github.com/repos/$REPO/releases/latest" |
+        jq --exit-status --raw-output '.tag_name | select(type == "string" and length > 0)'
+)
 echo "Latest version: $LATEST_RELEASE"
 
 # Construct download URL
@@ -24,10 +28,11 @@ DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_RELEASE/$ASSET_
 
 # Create temp working dir
 TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
 echo "Using temp directory: $TMPDIR"
 
 # Download binary
-curl -L "$DOWNLOAD_URL" -o "$TMPDIR/$ASSET_NAME"
+curl --fail --location --show-error "$DOWNLOAD_URL" -o "$TMPDIR/$ASSET_NAME"
 chmod +x "$TMPDIR/$ASSET_NAME"
 echo "Downloaded and set executable permissions on $TMPDIR/$ASSET_NAME"
 
@@ -56,6 +61,3 @@ rpclip-client get' > "$TMPDIR/rpp"
 chmod +x "$TMPDIR/rpp"
 mv "$TMPDIR/rpp" "$INSTALL_DIR/rpp"
 echo "Installed rpp script to $INSTALL_DIR/rpp"
-
-# Clean up temp dir
-rm -rf "$TMPDIR"
