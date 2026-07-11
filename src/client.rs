@@ -269,7 +269,17 @@ async fn main() {
                 ver: 1,
                 data: ciphertext,
             };
-            client.set_clip(context::current(), blob).await.unwrap();
+            match client.set_clip(context::current(), blob).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    error!("Server failed to set clipboard: {}", e);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    error!("Clipboard RPC failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }

@@ -50,7 +50,7 @@ impl RpClip for TestServer {
         AgeEncryptedBlob { ver: 1, data: out }
     }
 
-    async fn set_clip(self, _: context::Context, blob: AgeEncryptedBlob) {
+    async fn set_clip(self, _: context::Context, blob: AgeEncryptedBlob) -> Result<(), String> {
         let key_bytes = std::fs::read(&self.ssh_key_path).expect("read server key");
         let identity = ssh::Identity::from_buffer(
             std::io::Cursor::new(key_bytes),
@@ -68,6 +68,7 @@ impl RpClip for TestServer {
         self.clipboard
             .set_text(rpclip::line_end::to_platform_line_ending(&text))
             .await;
+        Ok(())
     }
 }
 
@@ -150,7 +151,8 @@ async fn encrypted_round_trip() {
     client
         .set_clip(context::current(), blob)
         .await
-        .expect("set_clip");
+        .expect("set_clip RPC")
+        .expect("server set_clip");
 
     // Give the server a moment to process
     tokio::time::sleep(Duration::from_millis(50)).await;

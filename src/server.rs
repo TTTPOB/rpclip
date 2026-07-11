@@ -87,14 +87,14 @@ impl RpClip for RpClipServer {
         AgeEncryptedBlob { ver: 1, data: out }
     }
 
-    async fn set_clip(self, _: context::Context, blob: AgeEncryptedBlob) {
+    async fn set_clip(self, _: context::Context, blob: AgeEncryptedBlob) -> Result<(), String> {
         // Decrypt with server's SSH private key
         let key_path = expand_tilde(&self.ssh_key_path);
         let key_bytes = match std::fs::read(&key_path) {
             Ok(b) => b,
             Err(e) => {
                 error!("failed to read ssh key {}: {}", key_path, e);
-                return;
+                return Err(format!("failed to read server SSH key: {e}"));
             }
         };
         let identity = match ssh::Identity::from_buffer(
@@ -104,47 +104,49 @@ impl RpClip for RpClipServer {
             Ok(i) => i,
             Err(e) => {
                 error!("failed to parse ssh identity {}: {:?}", key_path, e);
-                return;
+                return Err(format!("failed to parse server SSH identity: {e:?}"));
             }
         };
         let decryptor = match Decryptor::new(&blob.data[..]) {
             Ok(d) => d,
             Err(e) => {
                 error!("decryptor error: {}", e);
-                return;
+                return Err(format!("failed to read encrypted clipboard data: {e}"));
             }
         };
         let mut reader = match decryptor.decrypt(std::iter::once(&identity as &dyn age::Identity)) {
             Ok(r) => r,
             Err(e) => {
                 error!("decrypt error: {}", e);
-                return;
+                return Err(format!("failed to decrypt clipboard data: {e}"));
             }
         };
         use std::io::Read;
         let mut plaintext = Vec::new();
         if let Err(e) = reader.read_to_end(&mut plaintext) {
             error!("decrypt read error: {}", e);
-            return;
+            return Err(format!("failed to decrypt clipboard data: {e}"));
         }
 
         let text = match String::from_utf8(plaintext) {
             Ok(s) => s,
             Err(e) => {
                 error!("utf8 error: {}", e);
-                return;
+                return Err(format!("clipboard data is not valid UTF-8: {e}"));
             }
         };
 
-        if let Err(_) = self
+        if let Err(e) = self
             .clipboard
             .lock()
             .await
             .set_text(rpclip::line_end::to_platform_line_ending(&text))
         {
-            error!("server failed to set clipboard text");
+            error!("server failed to set clipboard text: {e}");
+            Err(format!("failed to set system clipboard: {e}"))
         } else {
             info!("server set clipboard text (len={} bytes)", text.len());
+            Ok(())
         }
     }
 }

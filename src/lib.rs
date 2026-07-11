@@ -13,7 +13,7 @@ pub trait RpClip {
     async fn get_clip(client_ssh_pubkey_line: String) -> AgeEncryptedBlob;
 
     // Client sends ciphertext encrypted for the server
-    async fn set_clip(blob: AgeEncryptedBlob);
+    async fn set_clip(blob: AgeEncryptedBlob) -> Result<(), String>;
 }
 
 pub mod line_end {
