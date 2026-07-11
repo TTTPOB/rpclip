@@ -212,7 +212,15 @@ async fn main() {
         .unwrap_or_else(|| "~/.ssh/id_ed25519".to_string());
     info!("Clipboard server started");
     futures::stream::select_all(listeners)
-        .filter_map(|r| future::ready(r.ok()))
+        .filter_map(|result| {
+            future::ready(match result {
+                Ok(transport) => Some(transport),
+                Err(e) => {
+                    error!("Failed to accept client connection: {e}");
+                    None
+                }
+            })
+        })
         .map(server::BaseChannel::with_defaults)
         .map(|channel| {
             let rpserver = RpClipServer {
@@ -225,8 +233,10 @@ async fn main() {
             })
         })
         .buffer_unordered(10)
-        .for_each(|_| async {}) // discard the result of the `map`
+        .for_each(|_| async {})
         .await;
+    error!("All server listeners stopped");
+    std::process::exit(1);
 }
 
 #[cfg(test)]
