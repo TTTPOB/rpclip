@@ -3,7 +3,9 @@ use age::{Decryptor, Encryptor};
 use clap::{Parser, Subcommand};
 use log::{error, info, warn};
 use rpclip::auth;
-use rpclip::{AgeEncryptedBlob, Challenge, RpClipClient, SetRequest, PROTOCOL_VERSION};
+use rpclip::{
+    AgeEncryptedBlob, Challenge, ClipboardOperation, RpClipClient, SetRequest, PROTOCOL_VERSION,
+};
 use serde::Deserialize;
 use ssh_key::{PrivateKey, PublicKey};
 use std::future::Future;
@@ -185,10 +187,16 @@ fn load_client_credentials(config: Option<&Config>) -> Result<ClientCredentials,
 
 async fn issue_challenge(
     client: &RpClipClient,
-    client_public_key_line: String,
+    credentials: &ClientCredentials,
+    operation: ClipboardOperation,
 ) -> Result<Challenge, String> {
+    let request = auth::sign_challenge_request(
+        &credentials.private_key,
+        credentials.public_key_line.clone(),
+        operation,
+    )?;
     let challenge = client
-        .issue_challenge(context::current(), client_public_key_line)
+        .issue_challenge(context::current(), request)
         .await
         .map_err(|e| format!("challenge RPC failed: {e}"))??;
     challenge
@@ -303,7 +311,7 @@ async fn main() {
     match &args.command {
         Commands::Get => {
             let challenge =
-                match issue_challenge(&client, credentials.public_key_line.clone()).await {
+                match issue_challenge(&client, &credentials, ClipboardOperation::Get).await {
                     Ok(challenge) => challenge,
                     Err(e) => {
                         error!("Server refused authentication challenge: {e}");
@@ -379,7 +387,7 @@ async fn main() {
                 data: ciphertext,
             };
             let challenge =
-                match issue_challenge(&client, credentials.public_key_line.clone()).await {
+                match issue_challenge(&client, &credentials, ClipboardOperation::Set).await {
                     Ok(challenge) => challenge,
                     Err(e) => {
                         error!("Server refused authentication challenge: {e}");
@@ -400,8 +408,17 @@ async fn main() {
                 auth: auth_request,
                 blob,
             };
-            match client.set_clip(context::current(), request).await {
-                Ok(Ok(())) => {}
+            match client.set_clip(context::current(), request.clone()).await {
+                Ok(Ok(response)) => {
+                    if let Err(e) = auth::verify_set_response(
+                        &credentials.server_public_key,
+                        &request,
+                        &response,
+                    ) {
+                        error!("Server set response failed authentication: {e}");
+                        std::process::exit(1);
+                    }
+                }
                 Ok(Err(e)) => {
                     error!("Server failed to set clipboard: {}", e);
                     std::process::exit(1);

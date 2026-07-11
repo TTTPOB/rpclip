@@ -4,11 +4,11 @@ use arboard::Clipboard;
 use clap::Parser;
 use futures::prelude::*;
 use log::{error, info};
-use rpclip::auth::{self, AuthorizedClients, ChallengeStore, CHALLENGE_TTL};
+use rpclip::auth::{self, AuthorizedClients, ChallengeStore, ServerAuthenticator, CHALLENGE_TTL};
 use rpclip::{
-    AgeEncryptedBlob, AuthRequest, Challenge, RpClip, SetRequest, SignedClipboard, PROTOCOL_VERSION,
+    AgeEncryptedBlob, AuthRequest, Challenge, ChallengeRequest, RpClip, SetRequest,
+    SignedClipboard, SignedSetResponse, PROTOCOL_VERSION,
 };
-use ssh_key::{PrivateKey, PublicKey};
 use std::str::FromStr;
 use std::{
     net::SocketAddr,
@@ -17,18 +17,24 @@ use std::{
 };
 use tarpc::{
     context,
-    server::{self, Channel},
+    server::{
+        self,
+        incoming::{spawn_incoming, Incoming},
+    },
     tokio_serde::formats::Bincode,
 };
+
+const MAX_OPEN_CHANNELS: u32 = 64;
+const MAX_CONCURRENT_REQUESTS_PER_CHANNEL: usize = 8;
 
 #[derive(Parser)]
 struct Args {
     #[arg(short, long, value_name = "IP:PORT", required = true)]
     address: Vec<SocketAddr>,
-    /// Path to server's SSH private key (OpenSSH format). Defaults to ~/.ssh/id_ed25519
+    /// Unencrypted Ed25519 server private key. Defaults to ~/.ssh/id_ed25519
     #[arg(long)]
     ssh_key_path: Option<String>,
-    /// OpenSSH authorized_keys file. Defaults to ~/.ssh/authorized_keys
+    /// OpenSSH authorized_keys file. Defaults to the platform OpenSSH user file
     #[arg(long)]
     authorized_keys_path: Option<String>,
 }
@@ -37,19 +43,16 @@ struct Args {
 struct RpClipServer {
     clipboard: Arc<Mutex<Clipboard>>,
     ssh_key_path: String,
-    private_key: Arc<PrivateKey>,
-    authorized_clients: Arc<AuthorizedClients>,
-    challenges: Arc<ChallengeStore>,
+    authenticator: Arc<ServerAuthenticator>,
 }
 
 impl RpClip for RpClipServer {
     async fn issue_challenge(
         self,
         _: context::Context,
-        client_ssh_pubkey_line: String,
+        request: ChallengeRequest,
     ) -> Result<Challenge, String> {
-        let public_key = self.authorize_client(&client_ssh_pubkey_line)?;
-        self.challenges.issue(&public_key)
+        self.authenticator.issue_challenge(&request)
     }
 
     async fn get_clip(
@@ -57,52 +60,35 @@ impl RpClip for RpClipServer {
         _: context::Context,
         auth_request: AuthRequest,
     ) -> Result<SignedClipboard, String> {
-        let public_key = self.authenticate_get(&auth_request)?;
-        self.challenges
-            .consume(&auth_request.challenge, &public_key)?;
+        self.authenticator.authenticate_get(&auth_request)?;
 
         let clipboard = self.clipboard.clone();
-        let private_key = self.private_key.clone();
+        let authenticator = self.authenticator.clone();
         tokio::task::spawn_blocking(move || {
             let blob = encrypt_clipboard(clipboard, auth_request.client_ssh_pubkey.clone())?;
-            auth::sign_get_response(&private_key, &auth_request, blob)
+            authenticator.sign_get_response(&auth_request, blob)
         })
         .await
         .map_err(|e| format!("clipboard worker failed: {e}"))?
     }
 
-    async fn set_clip(self, _: context::Context, request: SetRequest) -> Result<(), String> {
-        let public_key = self.authenticate_set(&request)?;
-        self.challenges
-            .consume(&request.auth.challenge, &public_key)?;
+    async fn set_clip(
+        self,
+        _: context::Context,
+        request: SetRequest,
+    ) -> Result<SignedSetResponse, String> {
+        self.authenticator.authenticate_set(&request)?;
+        let response = self.authenticator.sign_set_response(&request)?;
 
         let clipboard = self.clipboard.clone();
         let ssh_key_path = self.ssh_key_path.clone();
+        let blob = request.blob;
         tokio::task::spawn_blocking(move || {
-            decrypt_and_set_clipboard(clipboard, ssh_key_path, request.blob)
+            decrypt_and_set_clipboard(clipboard, ssh_key_path, blob)
         })
         .await
-        .map_err(|e| format!("clipboard worker failed: {e}"))?
-    }
-}
-
-impl RpClipServer {
-    fn authorize_client(&self, public_key_line: &str) -> Result<PublicKey, String> {
-        let public_key = auth::parse_public_key(public_key_line)?;
-        self.authorized_clients.authorize(&public_key)?;
-        Ok(public_key)
-    }
-
-    fn authenticate_get(&self, request: &AuthRequest) -> Result<PublicKey, String> {
-        let public_key = self.authorize_client(&request.client_ssh_pubkey)?;
-        auth::verify_get_request(&public_key, request)?;
-        Ok(public_key)
-    }
-
-    fn authenticate_set(&self, request: &SetRequest) -> Result<PublicKey, String> {
-        let public_key = self.authorize_client(&request.auth.client_ssh_pubkey)?;
-        auth::verify_set_request(&public_key, &request.auth, &request.blob)?;
-        Ok(public_key)
+        .map_err(|e| format!("clipboard worker failed: {e}"))??;
+        Ok(response)
     }
 }
 
@@ -237,26 +223,158 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
+fn authorized_keys_path_for(
+    home: &std::path::Path,
+    windows_administrator: bool,
+    program_data: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, String> {
+    if windows_administrator {
+        let program_data = program_data.ok_or_else(|| {
+            "ProgramData is not set; pass --authorized-keys-path explicitly".to_string()
+        })?;
+        Ok(PathBuf::from(program_data)
+            .join("ssh")
+            .join("administrators_authorized_keys"))
+    } else {
+        Ok(home.join(".ssh").join("authorized_keys"))
+    }
+}
+
+fn default_authorized_keys_path() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        "cannot determine home directory; pass --authorized-keys-path".to_string()
+    })?;
+    #[cfg(windows)]
+    {
+        return authorized_keys_path_for(
+            &home,
+            current_user_is_windows_administrator()?,
+            std::env::var_os("ProgramData").as_deref(),
+        );
+    }
+    #[cfg(not(windows))]
+    authorized_keys_path_for(&home, false, None)
+}
+
+#[cfg(windows)]
+fn current_user_is_windows_administrator() -> Result<bool, String> {
+    use std::ptr::{null_mut, NonNull};
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{
+        AllocateAndInitializeSid, EqualSid, FreeSid, GetTokenInformation, TokenGroups,
+        SECURITY_NT_AUTHORITY, TOKEN_GROUPS, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::SystemServices::{
+        DOMAIN_ALIAS_RID_ADMINS, SECURITY_BUILTIN_DOMAIN_RID,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut administrator_sid = null_mut();
+    let allocated = unsafe {
+        AllocateAndInitializeSid(
+            &SECURITY_NT_AUTHORITY,
+            2,
+            SECURITY_BUILTIN_DOMAIN_RID as u32,
+            DOMAIN_ALIAS_RID_ADMINS as u32,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &mut administrator_sid,
+        )
+    };
+    if allocated == 0 {
+        return Err(format!(
+            "failed to determine Windows administrator membership: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let administrator_sid =
+        NonNull::new(administrator_sid).expect("AllocateAndInitializeSid returned a null SID");
+
+    let mut token = null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        unsafe {
+            FreeSid(administrator_sid.as_ptr());
+        }
+        return Err(format!(
+            "failed to open the Windows process token: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut required_bytes = 0;
+    unsafe {
+        GetTokenInformation(token, TokenGroups, null_mut(), 0, &mut required_bytes);
+    }
+    if required_bytes == 0 {
+        unsafe {
+            CloseHandle(token);
+            FreeSid(administrator_sid.as_ptr());
+        }
+        return Err(format!(
+            "failed to size the Windows token group list: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let word_size = std::mem::size_of::<usize>();
+    let mut buffer = vec![0_usize; (required_bytes as usize).div_ceil(word_size)];
+    let loaded = unsafe {
+        GetTokenInformation(
+            token,
+            TokenGroups,
+            buffer.as_mut_ptr().cast(),
+            required_bytes,
+            &mut required_bytes,
+        )
+    };
+    if loaded == 0 {
+        unsafe {
+            CloseHandle(token);
+            FreeSid(administrator_sid.as_ptr());
+        }
+        return Err(format!(
+            "failed to read the Windows token group list: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let groups = buffer.as_ptr().cast::<TOKEN_GROUPS>();
+    let is_member = unsafe {
+        std::slice::from_raw_parts((*groups).Groups.as_ptr(), (*groups).GroupCount as usize)
+            .iter()
+            .any(|group| EqualSid(group.Sid, administrator_sid.as_ptr()) != 0)
+    };
+    unsafe {
+        CloseHandle(token);
+        FreeSid(administrator_sid.as_ptr());
+    }
+    Ok(is_member)
+}
+
 fn load_server_security(
     ssh_key_path: Option<String>,
     authorized_keys_path: Option<String>,
-) -> Result<(String, Arc<PrivateKey>, Arc<AuthorizedClients>), String> {
+) -> Result<(String, Arc<ServerAuthenticator>), String> {
     let ssh_key_path =
         expand_tilde(&ssh_key_path.unwrap_or_else(|| "~/.ssh/id_ed25519".to_string()));
-    let authorized_keys_path = PathBuf::from(expand_tilde(
-        &authorized_keys_path.unwrap_or_else(|| "~/.ssh/authorized_keys".to_string()),
-    ));
-    let private_key = auth::read_private_key(PathBuf::from(&ssh_key_path).as_path())?;
+    let authorized_keys_path = match authorized_keys_path {
+        Some(path) => PathBuf::from(expand_tilde(&path)),
+        None => default_authorized_keys_path()?,
+    };
+    let private_key = auth::read_server_private_key(PathBuf::from(&ssh_key_path).as_path())?;
     let authorized_clients = AuthorizedClients::read_file(&authorized_keys_path)?;
     info!(
         "Loaded client authorization keys from {}",
         authorized_keys_path.display()
     );
-    Ok((
-        ssh_key_path,
+    let authenticator = ServerAuthenticator::new(
         Arc::new(private_key),
         Arc::new(authorized_clients),
-    ))
+        Arc::new(ChallengeStore::new(CHALLENGE_TTL)),
+    );
+    Ok((ssh_key_path, Arc::new(authenticator)))
 }
 
 #[tokio::main]
@@ -264,7 +382,7 @@ async fn main() {
     env_logger::init();
     // Parse command line arguments
     let args = Args::parse();
-    let (ssh_key_path, private_key, authorized_clients) =
+    let (ssh_key_path, authenticator) =
         load_server_security(args.ssh_key_path, args.authorized_keys_path).unwrap_or_else(|e| {
             error!("Unable to initialize server authentication: {e}");
             std::process::exit(1);
@@ -284,9 +402,13 @@ async fn main() {
             .expect("clipboard worker failed")
             .expect("failed to initialize system clipboard"),
     ));
-    let challenges = Arc::new(ChallengeStore::new(CHALLENGE_TTL));
     info!("Clipboard server started");
-    futures::stream::select_all(listeners)
+    let rpserver = RpClipServer {
+        clipboard,
+        ssh_key_path,
+        authenticator,
+    };
+    let incoming = futures::stream::select_all(listeners)
         .filter_map(|result| {
             future::ready(match result {
                 Ok(transport) => Some(transport),
@@ -297,22 +419,10 @@ async fn main() {
             })
         })
         .map(server::BaseChannel::with_defaults)
-        .map(|channel| {
-            let rpserver = RpClipServer {
-                clipboard: clipboard.clone(),
-                ssh_key_path: ssh_key_path.clone(),
-                private_key: private_key.clone(),
-                authorized_clients: authorized_clients.clone(),
-                challenges: challenges.clone(),
-            };
-            channel.execute(rpserver.serve()).for_each(|x| async {
-                tokio::spawn(x);
-                info!("New client connected");
-            })
-        })
-        .buffer_unordered(10)
-        .for_each(|_| async {})
-        .await;
+        .max_channels_per_key(MAX_OPEN_CHANNELS, |_| "global")
+        .max_concurrent_requests_per_channel(MAX_CONCURRENT_REQUESTS_PER_CHANNEL)
+        .execute(rpserver.serve());
+    spawn_incoming(incoming).await;
     error!("All server listeners stopped");
     std::process::exit(1);
 }
@@ -341,5 +451,26 @@ mod tests {
                 "[::1]:6667".parse().unwrap(),
             ]
         );
+        assert_eq!(
+            args.authorized_keys_path.as_deref(),
+            Some("authorized_keys")
+        );
+    }
+
+    #[test]
+    fn selects_openssh_authorized_keys_paths() {
+        let home = std::path::Path::new("users/example");
+        assert_eq!(
+            authorized_keys_path_for(home, false, None).unwrap(),
+            home.join(".ssh").join("authorized_keys")
+        );
+        assert_eq!(
+            authorized_keys_path_for(home, true, Some(std::ffi::OsStr::new("program-data")),)
+                .unwrap(),
+            PathBuf::from("program-data")
+                .join("ssh")
+                .join("administrators_authorized_keys")
+        );
+        assert!(authorized_keys_path_for(home, true, None).is_err());
     }
 }

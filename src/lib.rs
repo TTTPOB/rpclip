@@ -2,7 +2,29 @@ use serde::{Deserialize, Serialize};
 
 pub mod auth;
 
-pub const PROTOCOL_VERSION: u8 = 3;
+pub const PROTOCOL_VERSION: u8 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ClipboardOperation {
+    Get,
+    Set,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChallengeRequest {
+    pub ver: u8,
+    pub operation: ClipboardOperation,
+    pub client_ssh_pubkey: String,
+    pub client_nonce: [u8; 32],
+    pub issued_at_unix_seconds: u64,
+    pub signature: String,
+}
+
+impl ChallengeRequest {
+    pub fn validate_version(&self) -> Result<(), String> {
+        validate_version(self.ver)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Challenge {
@@ -56,6 +78,18 @@ pub struct SignedClipboard {
     pub signature: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedSetResponse {
+    pub ver: u8,
+    pub signature: String,
+}
+
+impl SignedSetResponse {
+    pub fn validate_version(&self) -> Result<(), String> {
+        validate_version(self.ver)
+    }
+}
+
 impl SignedClipboard {
     pub fn validate_version(&self) -> Result<(), String> {
         validate_version(self.ver)?;
@@ -76,11 +110,11 @@ fn validate_version(version: u8) -> Result<(), String> {
 
 #[tarpc::service]
 pub trait RpClip {
-    async fn issue_challenge(client_ssh_pubkey_line: String) -> Result<Challenge, String>;
+    async fn issue_challenge(request: ChallengeRequest) -> Result<Challenge, String>;
 
     async fn get_clip(auth: AuthRequest) -> Result<SignedClipboard, String>;
 
-    async fn set_clip(request: SetRequest) -> Result<(), String>;
+    async fn set_clip(request: SetRequest) -> Result<SignedSetResponse, String>;
 }
 
 pub mod line_end {

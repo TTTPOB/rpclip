@@ -4,10 +4,10 @@ use std::time::Duration;
 use age::ssh;
 use age::{Decryptor, Encryptor};
 use futures::StreamExt;
-use rpclip::auth::{self, AuthorizedClients, ChallengeStore};
+use rpclip::auth::{self, AuthorizedClients, ChallengeStore, ServerAuthenticator};
 use rpclip::{
-    AgeEncryptedBlob, AuthRequest, Challenge, RpClip, RpClipClient, SetRequest, SignedClipboard,
-    PROTOCOL_VERSION,
+    AgeEncryptedBlob, AuthRequest, Challenge, ChallengeRequest, ClipboardOperation, RpClip,
+    RpClipClient, SetRequest, SignedClipboard, SignedSetResponse, PROTOCOL_VERSION,
 };
 use ssh_key::{Algorithm, LineEnding, PrivateKey};
 use std::sync::Arc;
@@ -34,20 +34,16 @@ impl TestClipboard {
 struct TestServer {
     clipboard: TestClipboard,
     ssh_key_path: String,
-    private_key: Arc<PrivateKey>,
-    authorized_clients: Arc<AuthorizedClients>,
-    challenges: Arc<ChallengeStore>,
+    authenticator: Arc<ServerAuthenticator>,
 }
 
 impl RpClip for TestServer {
     async fn issue_challenge(
         self,
         _: context::Context,
-        client_ssh_pubkey_line: String,
+        request: ChallengeRequest,
     ) -> Result<Challenge, String> {
-        let public_key = auth::parse_public_key(&client_ssh_pubkey_line)?;
-        self.authorized_clients.authorize(&public_key)?;
-        self.challenges.issue(&public_key)
+        self.authenticator.issue_challenge(&request)
     }
 
     async fn get_clip(
@@ -55,11 +51,7 @@ impl RpClip for TestServer {
         _: context::Context,
         auth_request: AuthRequest,
     ) -> Result<SignedClipboard, String> {
-        let public_key = auth::parse_public_key(&auth_request.client_ssh_pubkey)?;
-        self.authorized_clients.authorize(&public_key)?;
-        auth::verify_get_request(&public_key, &auth_request)?;
-        self.challenges
-            .consume(&auth_request.challenge, &public_key)?;
+        self.authenticator.authenticate_get(&auth_request)?;
 
         let text = self.clipboard.get_text().await;
         let recipient =
@@ -75,16 +67,16 @@ impl RpClip for TestServer {
             ver: PROTOCOL_VERSION,
             data: out,
         };
-        auth::sign_get_response(&self.private_key, &auth_request, blob)
+        self.authenticator.sign_get_response(&auth_request, blob)
     }
 
-    async fn set_clip(self, _: context::Context, request: SetRequest) -> Result<(), String> {
-        let public_key = auth::parse_public_key(&request.auth.client_ssh_pubkey)?;
-        self.authorized_clients.authorize(&public_key)?;
-        auth::verify_set_request(&public_key, &request.auth, &request.blob)?;
-        self.challenges
-            .consume(&request.auth.challenge, &public_key)?;
-        request.blob.validate_version()?;
+    async fn set_clip(
+        self,
+        _: context::Context,
+        request: SetRequest,
+    ) -> Result<SignedSetResponse, String> {
+        self.authenticator.authenticate_set(&request)?;
+        let response = self.authenticator.sign_set_response(&request)?;
 
         let key_bytes = std::fs::read(&self.ssh_key_path).expect("read server key");
         let identity = ssh::Identity::from_buffer(
@@ -103,15 +95,14 @@ impl RpClip for TestServer {
         self.clipboard
             .set_text(rpclip::line_end::to_platform_line_ending(&text))
             .await;
-        Ok(())
+        Ok(response)
     }
 }
 
 async fn start_test_server(
     addr: std::net::SocketAddr,
     ssh_key_path: String,
-    private_key: Arc<PrivateKey>,
-    authorized_clients: Arc<AuthorizedClients>,
+    authenticator: Arc<ServerAuthenticator>,
     clipboard: TestClipboard,
 ) -> JoinHandle<()> {
     let listener = tarpc::serde_transport::tcp::listen(&addr, Bincode::default)
@@ -125,9 +116,7 @@ async fn start_test_server(
                 let rpserver = TestServer {
                     clipboard: clipboard.clone(),
                     ssh_key_path: ssh_key_path.clone(),
-                    private_key: private_key.clone(),
-                    authorized_clients: authorized_clients.clone(),
-                    challenges: Arc::new(ChallengeStore::default()),
+                    authenticator: authenticator.clone(),
                 };
                 channel.execute(rpserver.serve()).for_each(|x| async {
                     tokio::spawn(x);
@@ -172,6 +161,11 @@ async fn encrypted_round_trip() {
     let authorized_clients = Arc::new(
         AuthorizedClients::read_file(&authorized_keys_path).expect("read authorized clients"),
     );
+    let authenticator = Arc::new(ServerAuthenticator::new(
+        server_private_key.clone(),
+        authorized_clients,
+        Arc::new(ChallengeStore::default()),
+    ));
 
     // Random port
     let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 0");
@@ -183,8 +177,7 @@ async fn encrypted_round_trip() {
     let _server_handle = start_test_server(
         addr,
         server_key_path.clone(),
-        server_private_key.clone(),
-        authorized_clients,
+        authenticator,
         clipboard.clone(),
     )
     .await;
@@ -212,8 +205,14 @@ async fn encrypted_round_trip() {
         ver: PROTOCOL_VERSION,
         data: out,
     };
+    let challenge_request = auth::sign_challenge_request(
+        &client_private_key,
+        client_pub_line.clone(),
+        ClipboardOperation::Set,
+    )
+    .expect("sign challenge request");
     let challenge = client
-        .issue_challenge(context::current(), client_pub_line.clone())
+        .issue_challenge(context::current(), challenge_request)
         .await
         .expect("challenge RPC")
         .expect("challenge");
@@ -224,24 +223,31 @@ async fn encrypted_round_trip() {
         &blob,
     )
     .expect("sign set request");
-    client
-        .set_clip(
-            context::current(),
-            SetRequest {
-                auth: set_auth,
-                blob,
-            },
-        )
+    let set_request = SetRequest {
+        auth: set_auth,
+        blob,
+    };
+    let set_response = client
+        .set_clip(context::current(), set_request.clone())
         .await
         .expect("set_clip RPC")
         .expect("server set_clip");
+    let server_public_key = auth::parse_public_key(&server_pub_line).expect("server public key");
+    auth::verify_set_response(&server_public_key, &set_request, &set_response)
+        .expect("verify set response");
 
     // Give the server a moment to process
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Request get encrypted to client key and decrypt
+    let challenge_request = auth::sign_challenge_request(
+        &client_private_key,
+        client_pub_line.clone(),
+        ClipboardOperation::Get,
+    )
+    .expect("sign challenge request");
     let challenge = client
-        .issue_challenge(context::current(), client_pub_line.clone())
+        .issue_challenge(context::current(), challenge_request)
         .await
         .expect("challenge RPC")
         .expect("challenge");
@@ -252,7 +258,6 @@ async fn encrypted_round_trip() {
         .await
         .expect("get_clip RPC")
         .expect("server get_clip");
-    let server_public_key = auth::parse_public_key(&server_pub_line).expect("server public key");
     auth::verify_get_response(&server_public_key, &get_auth, &response)
         .expect("verify server response");
 
