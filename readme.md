@@ -17,9 +17,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/tttpob/rpclip/refs/heads/mas
 ```pwsh
 rpclip-server --address 127.0.0.1:6667 --address '[::1]:6667'
 ```
-Usually the server runs on your local Windows machine. The server uses `~/.ssh/id_ed25519` by default to decrypt incoming data and sign clipboard responses. Override it with `--ssh-key-path <PATH>`.
+Usually the server runs on your local Windows machine. The server uses `~/.ssh/id_ed25519` by default to decrypt incoming data and sign operation results. The server key must be an unencrypted Ed25519 OpenSSH private key. RpClip does not support passphrase-protected server keys. Override the path with `--ssh-key-path <PATH>`.
 
-The server authorizes client keys from the running user's `~/.ssh/authorized_keys` by default. Use a dedicated file when the SSH login list and clipboard access list should differ:
+The server uses the OpenSSH authorization file for the running account by default. Linux and regular Windows users use `~/.ssh/authorized_keys`. A Windows account running with an administrator token uses `%ProgramData%\ssh\administrators_authorized_keys`, matching the Windows OpenSSH administrator configuration. Use a dedicated file when the SSH login list and clipboard access list should differ:
 
 ```pwsh
 rpclip-server `
@@ -76,12 +76,14 @@ ssh_pubkey_path: "~/.ssh/id_ed25519.pub"
 # Required: server's SSH public key (OpenSSH one-line format)
 server_ssh_pubkey: "ssh-ed25519 AAAAC3... user@host"
 ```
+The client private key must use an unencrypted OpenSSH format. RpClip reads the key file itself and does not use `ssh-agent` or prompt for a passphrase. Client Ed25519 keys work for signing and age encryption. RpClip also accepts RSA client keys when age accepts their size.
+
 You can also pass `--server <ADDRESS>` to override `server_addr`. Use `tcp://HOST:PORT` or `unix://PATH` to select the transport explicitly. Existing numeric TCP addresses and path-like Unix socket addresses remain supported. If neither flag nor config is provided, the client uses `127.0.0.1:6667`.
 
 If you used the Linux installer script, wrapper commands are available: `rpc` (send/set) and `rpp` (receive/get).
 
 ## Authentication
 
-For each operation, the server issues a random challenge that expires after 30 seconds. The client signs the protocol version, operation, challenge, client public key, and encrypted payload. The server checks the signature against its authorization file and consumes the challenge once. A captured request cannot authorize another operation or replay the same clipboard update.
+For each operation, the client first signs a fresh client nonce, the protocol version, operation, and client public key. The server verifies this proof of private-key possession before it issues a random challenge. The challenge expires after 30 seconds. The client signs the challenge and operation payload, and the server consumes the challenge once. A captured request cannot authorize another operation or replay the same clipboard update.
 
-For `get`, the server encrypts the clipboard to the client key and signs the response with its private key. The client verifies that signature against `server_ssh_pubkey` before it decrypts or prints the clipboard. Protocol version 3 changes the RPC schema, so version 3 clients require a version 3 server.
+For `get`, the server encrypts the clipboard to the client key and signs the response with its private key. For `set`, the server signs the successful result and binds it to the client's identity, challenge, and ciphertext. The client verifies either success response against `server_ssh_pubkey` before it prints data or exits successfully. Protocol version 4 changes the RPC schema, so version 4 clients require a version 4 server.
