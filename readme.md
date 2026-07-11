@@ -15,11 +15,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/tttpob/rpclip/refs/heads/mas
 
 ## Running the Server
 ```pwsh
-rpclip-server --address 127.0.0.1:6667 --address '[::1]:6667'
+rpclip-server --address 127.0.0.1:6667 --address '[::1]:6667' --authorized-keys-path ~/.config/rpclip/authorized_keys
 ```
 Usually the server runs on your local Windows machine. The server uses `~/.ssh/id_ed25519` by default to decrypt incoming data and sign operation results. The server key must be an unencrypted Ed25519 OpenSSH private key. RpClip reads and validates the key once at startup, so key rotation requires a server restart. RpClip does not support passphrase-protected server keys. Override the path with `--ssh-key-path <PATH>`.
 
-The server uses the OpenSSH authorization file for the running account by default. Linux and regular Windows users use `~/.ssh/authorized_keys`. A Windows account running with an administrator token uses `%ProgramData%\ssh\administrators_authorized_keys`, matching the Windows OpenSSH administrator configuration. Use a dedicated file when the SSH login list and clipboard access list should differ:
+The server requires an explicit OpenSSH authorization file. Keep a dedicated file when SSH login access and clipboard access should differ:
 
 ```pwsh
 rpclip-server `
@@ -28,6 +28,8 @@ rpclip-server `
 ```
 
 The authorization file accepts multiple Ed25519 OpenSSH public keys and comments. RpClip rejects RSA, ECDSA, entries with OpenSSH options, and keys that age cannot parse. It cannot enforce restrictions such as `from=`, `command=`, or `expiry-time=`. The server exits at startup when the file is missing, empty, malformed, or contains an unsupported entry.
+
+You can explicitly pass `~/.ssh/authorized_keys` when every SSH-authorized key should also receive clipboard access. RpClip never selects that file implicitly.
 
 ## Setting Up SSH Remote Port Forwarding
 To communicate with the server from a remote client through SSH, set up remote port forwarding. On your SSH client machine, run:

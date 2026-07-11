@@ -32,9 +32,9 @@ struct Args {
     /// Unencrypted Ed25519 server private key. Defaults to ~/.ssh/id_ed25519
     #[arg(long)]
     ssh_key_path: Option<String>,
-    /// OpenSSH authorized_keys file. Defaults to the platform OpenSSH user file
-    #[arg(long)]
-    authorized_keys_path: Option<String>,
+    /// OpenSSH authorized_keys file containing clients allowed to use RpClip
+    #[arg(long, value_name = "PATH")]
+    authorized_keys_path: String,
 }
 
 #[derive(Clone)]
@@ -214,145 +214,13 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
-fn authorized_keys_path_for(
-    home: &std::path::Path,
-    windows_administrator: bool,
-    program_data: Option<&std::ffi::OsStr>,
-) -> Result<PathBuf, String> {
-    if windows_administrator {
-        let program_data = program_data.ok_or_else(|| {
-            "ProgramData is not set; pass --authorized-keys-path explicitly".to_string()
-        })?;
-        Ok(PathBuf::from(program_data)
-            .join("ssh")
-            .join("administrators_authorized_keys"))
-    } else {
-        Ok(home.join(".ssh").join("authorized_keys"))
-    }
-}
-
-fn default_authorized_keys_path() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or_else(|| {
-        "cannot determine home directory; pass --authorized-keys-path".to_string()
-    })?;
-    #[cfg(windows)]
-    let path = authorized_keys_path_for(
-        &home,
-        current_user_is_windows_administrator()?,
-        std::env::var_os("ProgramData").as_deref(),
-    );
-    #[cfg(not(windows))]
-    let path = authorized_keys_path_for(&home, false, None);
-    path
-}
-
-#[cfg(windows)]
-fn current_user_is_windows_administrator() -> Result<bool, String> {
-    use std::ptr::{null_mut, NonNull};
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::Security::{
-        AllocateAndInitializeSid, EqualSid, FreeSid, GetTokenInformation, TokenGroups,
-        SECURITY_NT_AUTHORITY, TOKEN_GROUPS, TOKEN_QUERY,
-    };
-    use windows_sys::Win32::System::SystemServices::{
-        DOMAIN_ALIAS_RID_ADMINS, SECURITY_BUILTIN_DOMAIN_RID,
-    };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    let mut administrator_sid = null_mut();
-    let allocated = unsafe {
-        AllocateAndInitializeSid(
-            &SECURITY_NT_AUTHORITY,
-            2,
-            SECURITY_BUILTIN_DOMAIN_RID as u32,
-            DOMAIN_ALIAS_RID_ADMINS as u32,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            &mut administrator_sid,
-        )
-    };
-    if allocated == 0 {
-        return Err(format!(
-            "failed to determine Windows administrator membership: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let administrator_sid =
-        NonNull::new(administrator_sid).expect("AllocateAndInitializeSid returned a null SID");
-
-    let mut token = null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        unsafe {
-            FreeSid(administrator_sid.as_ptr());
-        }
-        return Err(format!(
-            "failed to open the Windows process token: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let mut required_bytes = 0;
-    unsafe {
-        GetTokenInformation(token, TokenGroups, null_mut(), 0, &mut required_bytes);
-    }
-    if required_bytes == 0 {
-        unsafe {
-            CloseHandle(token);
-            FreeSid(administrator_sid.as_ptr());
-        }
-        return Err(format!(
-            "failed to size the Windows token group list: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let word_size = std::mem::size_of::<usize>();
-    let mut buffer = vec![0_usize; (required_bytes as usize).div_ceil(word_size)];
-    let loaded = unsafe {
-        GetTokenInformation(
-            token,
-            TokenGroups,
-            buffer.as_mut_ptr().cast(),
-            required_bytes,
-            &mut required_bytes,
-        )
-    };
-    if loaded == 0 {
-        unsafe {
-            CloseHandle(token);
-            FreeSid(administrator_sid.as_ptr());
-        }
-        return Err(format!(
-            "failed to read the Windows token group list: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-
-    let groups = buffer.as_ptr().cast::<TOKEN_GROUPS>();
-    let is_member = unsafe {
-        std::slice::from_raw_parts((*groups).Groups.as_ptr(), (*groups).GroupCount as usize)
-            .iter()
-            .any(|group| EqualSid(group.Sid, administrator_sid.as_ptr()) != 0)
-    };
-    unsafe {
-        CloseHandle(token);
-        FreeSid(administrator_sid.as_ptr());
-    }
-    Ok(is_member)
-}
-
 fn load_server_security(
     ssh_key_path: Option<String>,
-    authorized_keys_path: Option<String>,
+    authorized_keys_path: String,
 ) -> Result<(Arc<Vec<u8>>, Arc<ServerAuthenticator>), String> {
     let ssh_key_path =
         expand_tilde(&ssh_key_path.unwrap_or_else(|| "~/.ssh/id_ed25519".to_string()));
-    let authorized_keys_path = match authorized_keys_path {
-        Some(path) => PathBuf::from(expand_tilde(&path)),
-        None => default_authorized_keys_path()?,
-    };
+    let authorized_keys_path = PathBuf::from(expand_tilde(&authorized_keys_path));
     let key_snapshot = auth::read_server_key_snapshot(PathBuf::from(&ssh_key_path).as_path())?;
     let authorized_clients = AuthorizedClients::read_file(&authorized_keys_path)?;
     info!(
@@ -484,27 +352,20 @@ mod tests {
                 "[::1]:6667".parse().unwrap(),
             ]
         );
-        assert_eq!(
-            args.authorized_keys_path.as_deref(),
-            Some("authorized_keys")
-        );
+        assert_eq!(args.authorized_keys_path, "authorized_keys");
     }
 
     #[test]
-    fn selects_openssh_authorized_keys_paths() {
-        let home = std::path::Path::new("users/example");
+    fn requires_authorized_keys_path() {
+        let error = match Args::try_parse_from(["rpclip-server", "--address", "127.0.0.1:6667"]) {
+            Ok(_) => panic!("missing authorized keys path was accepted"),
+            Err(error) => error,
+        };
+
         assert_eq!(
-            authorized_keys_path_for(home, false, None).unwrap(),
-            home.join(".ssh").join("authorized_keys")
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
         );
-        assert_eq!(
-            authorized_keys_path_for(home, true, Some(std::ffi::OsStr::new("program-data")),)
-                .unwrap(),
-            PathBuf::from("program-data")
-                .join("ssh")
-                .join("administrators_authorized_keys")
-        );
-        assert!(authorized_keys_path_for(home, true, None).is_err());
     }
 
     #[tokio::test]
