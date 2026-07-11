@@ -6,13 +6,15 @@ use futures::prelude::*;
 use log::{error, info};
 use rpclip::{AgeEncryptedBlob, RpClip, PROTOCOL_VERSION};
 use std::str::FromStr;
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 use tarpc::{
     context,
     server::{self, Channel},
     tokio_serde::formats::Bincode,
 };
-use tokio::sync::Mutex;
 
 #[derive(Parser)]
 struct Args {
@@ -35,120 +37,144 @@ impl RpClip for RpClipServer {
         _: context::Context,
         client_ssh_pubkey_line: String,
     ) -> Result<AgeEncryptedBlob, String> {
-        let text = match self.clipboard.lock().await.get_text() {
-            Ok(text) => {
-                info!("server got clipboard text (len={} bytes)", text.len());
-                text
-            }
-            Err(e) => {
-                error!("server failed to open system clipboard: {e}");
-                return Err(format!("failed to read system clipboard: {e}"));
-            }
-        };
-
-        // Encrypt to client's SSH public key
-        let recipient = match ssh::Recipient::from_str(&client_ssh_pubkey_line) {
-            Ok(r) => r,
-            Err(e) => {
-                error!("invalid client ssh pubkey: {:?}", e);
-                return Err(format!("invalid client SSH public key: {e:?}"));
-            }
-        };
-        let recipients: Vec<&dyn age::Recipient> = vec![&recipient as &dyn age::Recipient];
-        let encryptor = match Encryptor::with_recipients(recipients.into_iter()) {
-            Ok(e) => e,
-            Err(e) => {
-                error!("encryptor error: {}", e);
-                return Err(format!("failed to initialize clipboard encryption: {e}"));
-            }
-        };
-        let mut out = Vec::new();
-        let mut writer = match encryptor.wrap_output(&mut out) {
-            Ok(writer) => writer,
-            Err(e) => {
-                error!("wrap_output error: {}", e);
-                return Err(format!("failed to initialize encrypted response: {e}"));
-            }
-        };
-        use std::io::Write;
-        if let Err(e) = writer.write_all(text.as_bytes()) {
-            error!("encrypt write error: {}", e);
-            return Err(format!("failed to encrypt clipboard data: {e}"));
-        }
-        if let Err(e) = writer.finish() {
-            error!("encrypt finish error: {}", e);
-            return Err(format!("failed to finish clipboard encryption: {e}"));
-        }
-
-        Ok(AgeEncryptedBlob {
-            ver: PROTOCOL_VERSION,
-            data: out,
-        })
+        let clipboard = self.clipboard.clone();
+        tokio::task::spawn_blocking(move || encrypt_clipboard(clipboard, client_ssh_pubkey_line))
+            .await
+            .map_err(|e| format!("clipboard worker failed: {e}"))?
     }
 
     async fn set_clip(self, _: context::Context, blob: AgeEncryptedBlob) -> Result<(), String> {
         blob.validate_version()?;
 
-        // Decrypt with server's SSH private key
-        let key_path = expand_tilde(&self.ssh_key_path);
-        let key_bytes = match std::fs::read(&key_path) {
-            Ok(b) => b,
-            Err(e) => {
-                error!("failed to read ssh key {}: {}", key_path, e);
-                return Err(format!("failed to read server SSH key: {e}"));
-            }
-        };
-        let identity = match ssh::Identity::from_buffer(
-            std::io::Cursor::new(key_bytes),
-            Some(key_path.clone()),
-        ) {
+        let clipboard = self.clipboard.clone();
+        let ssh_key_path = self.ssh_key_path.clone();
+        tokio::task::spawn_blocking(move || {
+            decrypt_and_set_clipboard(clipboard, ssh_key_path, blob)
+        })
+        .await
+        .map_err(|e| format!("clipboard worker failed: {e}"))?
+    }
+}
+
+fn encrypt_clipboard(
+    clipboard: Arc<Mutex<Clipboard>>,
+    client_ssh_pubkey_line: String,
+) -> Result<AgeEncryptedBlob, String> {
+    let text = match clipboard
+        .lock()
+        .map_err(|_| "clipboard lock is poisoned".to_string())?
+        .get_text()
+    {
+        Ok(text) => {
+            info!("server got clipboard text (len={} bytes)", text.len());
+            text
+        }
+        Err(e) => {
+            error!("server failed to open system clipboard: {e}");
+            return Err(format!("failed to read system clipboard: {e}"));
+        }
+    };
+
+    // Encrypt to client's SSH public key
+    let recipient = match ssh::Recipient::from_str(&client_ssh_pubkey_line) {
+        Ok(r) => r,
+        Err(e) => {
+            error!("invalid client ssh pubkey: {:?}", e);
+            return Err(format!("invalid client SSH public key: {e:?}"));
+        }
+    };
+    let recipients: Vec<&dyn age::Recipient> = vec![&recipient as &dyn age::Recipient];
+    let encryptor = match Encryptor::with_recipients(recipients.into_iter()) {
+        Ok(e) => e,
+        Err(e) => {
+            error!("encryptor error: {}", e);
+            return Err(format!("failed to initialize clipboard encryption: {e}"));
+        }
+    };
+    let mut out = Vec::new();
+    let mut writer = match encryptor.wrap_output(&mut out) {
+        Ok(writer) => writer,
+        Err(e) => {
+            error!("wrap_output error: {}", e);
+            return Err(format!("failed to initialize encrypted response: {e}"));
+        }
+    };
+    use std::io::Write;
+    if let Err(e) = writer.write_all(text.as_bytes()) {
+        error!("encrypt write error: {}", e);
+        return Err(format!("failed to encrypt clipboard data: {e}"));
+    }
+    if let Err(e) = writer.finish() {
+        error!("encrypt finish error: {}", e);
+        return Err(format!("failed to finish clipboard encryption: {e}"));
+    }
+
+    Ok(AgeEncryptedBlob {
+        ver: PROTOCOL_VERSION,
+        data: out,
+    })
+}
+
+fn decrypt_and_set_clipboard(
+    clipboard: Arc<Mutex<Clipboard>>,
+    ssh_key_path: String,
+    blob: AgeEncryptedBlob,
+) -> Result<(), String> {
+    let key_path = expand_tilde(&ssh_key_path);
+    let key_bytes = match std::fs::read(&key_path) {
+        Ok(b) => b,
+        Err(e) => {
+            error!("failed to read ssh key {}: {}", key_path, e);
+            return Err(format!("failed to read server SSH key: {e}"));
+        }
+    };
+    let identity =
+        match ssh::Identity::from_buffer(std::io::Cursor::new(key_bytes), Some(key_path.clone())) {
             Ok(i) => i,
             Err(e) => {
                 error!("failed to parse ssh identity {}: {:?}", key_path, e);
                 return Err(format!("failed to parse server SSH identity: {e:?}"));
             }
         };
-        let decryptor = match Decryptor::new(&blob.data[..]) {
-            Ok(d) => d,
-            Err(e) => {
-                error!("decryptor error: {}", e);
-                return Err(format!("failed to read encrypted clipboard data: {e}"));
-            }
-        };
-        let mut reader = match decryptor.decrypt(std::iter::once(&identity as &dyn age::Identity)) {
-            Ok(r) => r,
-            Err(e) => {
-                error!("decrypt error: {}", e);
-                return Err(format!("failed to decrypt clipboard data: {e}"));
-            }
-        };
-        use std::io::Read;
-        let mut plaintext = Vec::new();
-        if let Err(e) = reader.read_to_end(&mut plaintext) {
-            error!("decrypt read error: {}", e);
+    let decryptor = match Decryptor::new(&blob.data[..]) {
+        Ok(d) => d,
+        Err(e) => {
+            error!("decryptor error: {}", e);
+            return Err(format!("failed to read encrypted clipboard data: {e}"));
+        }
+    };
+    let mut reader = match decryptor.decrypt(std::iter::once(&identity as &dyn age::Identity)) {
+        Ok(r) => r,
+        Err(e) => {
+            error!("decrypt error: {}", e);
             return Err(format!("failed to decrypt clipboard data: {e}"));
         }
+    };
+    use std::io::Read;
+    let mut plaintext = Vec::new();
+    if let Err(e) = reader.read_to_end(&mut plaintext) {
+        error!("decrypt read error: {}", e);
+        return Err(format!("failed to decrypt clipboard data: {e}"));
+    }
 
-        let text = match String::from_utf8(plaintext) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("utf8 error: {}", e);
-                return Err(format!("clipboard data is not valid UTF-8: {e}"));
-            }
-        };
-
-        if let Err(e) = self
-            .clipboard
-            .lock()
-            .await
-            .set_text(rpclip::line_end::to_platform_line_ending(&text))
-        {
-            error!("server failed to set clipboard text: {e}");
-            Err(format!("failed to set system clipboard: {e}"))
-        } else {
-            info!("server set clipboard text (len={} bytes)", text.len());
-            Ok(())
+    let text = match String::from_utf8(plaintext) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("utf8 error: {}", e);
+            return Err(format!("clipboard data is not valid UTF-8: {e}"));
         }
+    };
+
+    if let Err(e) = clipboard
+        .lock()
+        .map_err(|_| "clipboard lock is poisoned".to_string())?
+        .set_text(rpclip::line_end::to_platform_line_ending(&text))
+    {
+        error!("server failed to set clipboard text: {e}");
+        Err(format!("failed to set system clipboard: {e}"))
+    } else {
+        info!("server set clipboard text (len={} bytes)", text.len());
+        Ok(())
     }
 }
 
@@ -175,7 +201,12 @@ async fn main() {
         listeners.push(listener);
     }
 
-    let clipboard = Arc::new(Mutex::new(Clipboard::new().unwrap()));
+    let clipboard = Arc::new(Mutex::new(
+        tokio::task::spawn_blocking(Clipboard::new)
+            .await
+            .expect("clipboard worker failed")
+            .expect("failed to initialize system clipboard"),
+    ));
     let ssh_key_path = args
         .ssh_key_path
         .unwrap_or_else(|| "~/.ssh/id_ed25519".to_string());
