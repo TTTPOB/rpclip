@@ -52,7 +52,10 @@ fn signing_bytes(
 }
 
 pub fn parse_public_key(line: &str) -> Result<PublicKey, String> {
-    PublicKey::from_openssh(line).map_err(|e| format!("invalid SSH public key: {e}"))
+    let public_key =
+        PublicKey::from_openssh(line).map_err(|e| format!("invalid SSH public key: {e}"))?;
+    ensure_age_compatible(public_key.algorithm())?;
+    Ok(public_key)
 }
 
 pub fn read_private_key(path: &Path) -> Result<PrivateKey, String> {
@@ -64,7 +67,17 @@ pub fn read_private_key(path: &Path) -> Result<PrivateKey, String> {
             path.display()
         ));
     }
+    ensure_age_compatible(private_key.algorithm())?;
     Ok(private_key)
+}
+
+fn ensure_age_compatible(algorithm: Algorithm) -> Result<(), String> {
+    match algorithm {
+        Algorithm::Ed25519 | Algorithm::Rsa { .. } => Ok(()),
+        algorithm => Err(format!(
+            "SSH key algorithm {algorithm} cannot be used for age encryption"
+        )),
+    }
 }
 
 fn sign(private_key: &PrivateKey, message: &[u8]) -> Result<String, String> {
@@ -211,14 +224,7 @@ impl AuthorizedClients {
                     entry.config_opts()
                 ));
             }
-            match entry.public_key().algorithm() {
-                Algorithm::Ed25519 | Algorithm::Rsa { .. } => {}
-                algorithm => {
-                    return Err(format!(
-                        "authorized key algorithm {algorithm} cannot be used for age encryption"
-                    ));
-                }
-            }
+            ensure_age_compatible(entry.public_key().algorithm())?;
             keys.push(entry.public_key().clone());
         }
 
@@ -323,7 +329,7 @@ impl Default for ChallengeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ssh_key::{LineEnding, PrivateKey};
+    use ssh_key::{EcdsaCurve, LineEnding, PrivateKey};
 
     fn keypair() -> PrivateKey {
         PrivateKey::random(&mut OsRng, Algorithm::Ed25519).expect("generate key")
@@ -388,6 +394,21 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("authorized key options are not supported safely"));
+    }
+
+    #[test]
+    fn rejects_keys_that_age_cannot_use() {
+        let ecdsa = PrivateKey::random(
+            &mut OsRng,
+            Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP256,
+            },
+        )
+        .expect("generate ECDSA key");
+        let public_key_line = ecdsa.public_key().to_openssh().expect("public key");
+
+        let error = parse_public_key(&public_key_line).expect_err("ECDSA should be rejected");
+        assert!(error.contains("cannot be used for age encryption"));
     }
 
     #[test]
