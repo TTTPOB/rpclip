@@ -17,7 +17,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/tttpob/rpclip/refs/heads/mas
 ```pwsh
 rpclip-server --address 127.0.0.1:6667 --address '[::1]:6667'
 ```
-Usually the server runs on your local Windows machine. The server uses `~/.ssh/id_ed25519` by default to decrypt incoming data and sign operation results. The server key must be an unencrypted Ed25519 OpenSSH private key. RpClip does not support passphrase-protected server keys. Override the path with `--ssh-key-path <PATH>`.
+Usually the server runs on your local Windows machine. The server uses `~/.ssh/id_ed25519` by default to decrypt incoming data and sign operation results. The server key must be an unencrypted Ed25519 OpenSSH private key. RpClip reads and validates the key once at startup, so key rotation requires a server restart. RpClip does not support passphrase-protected server keys. Override the path with `--ssh-key-path <PATH>`.
 
 The server uses the OpenSSH authorization file for the running account by default. Linux and regular Windows users use `~/.ssh/authorized_keys`. A Windows account running with an administrator token uses `%ProgramData%\ssh\administrators_authorized_keys`, matching the Windows OpenSSH administrator configuration. Use a dedicated file when the SSH login list and clipboard access list should differ:
 
@@ -27,7 +27,7 @@ rpclip-server `
   --authorized-keys-path ~/.config/rpclip/authorized_keys
 ```
 
-The authorization file accepts multiple OpenSSH public keys and comments. RpClip rejects entries with OpenSSH options because it cannot enforce restrictions such as `from=`, `command=`, or `expiry-time=`. The server exits at startup when the file is missing, empty, malformed, contains options, or contains a key algorithm that age cannot use. RpClip currently accepts Ed25519 and RSA authorization keys.
+The authorization file accepts multiple Ed25519 OpenSSH public keys and comments. RpClip rejects RSA, ECDSA, entries with OpenSSH options, and keys that age cannot parse. It cannot enforce restrictions such as `from=`, `command=`, or `expiry-time=`. The server exits at startup when the file is missing, empty, malformed, or contains an unsupported entry.
 
 ## Setting Up SSH Remote Port Forwarding
 To communicate with the server from a remote client through SSH, set up remote port forwarding. On your SSH client machine, run:
@@ -76,7 +76,7 @@ ssh_pubkey_path: "~/.ssh/id_ed25519.pub"
 # Required: server's SSH public key (OpenSSH one-line format)
 server_ssh_pubkey: "ssh-ed25519 AAAAC3... user@host"
 ```
-The client private key must use an unencrypted OpenSSH format. RpClip reads the key file itself and does not use `ssh-agent` or prompt for a passphrase. Client Ed25519 keys work for signing and age encryption. RpClip also accepts RSA client keys when age accepts their size.
+The client private key must use an unencrypted Ed25519 OpenSSH format. RpClip reads the key file itself and does not use `ssh-agent` or prompt for a passphrase. RpClip rejects RSA and ECDSA client keys.
 
 You can also pass `--server <ADDRESS>` to override `server_addr`. Use `tcp://HOST:PORT` or `unix://PATH` to select the transport explicitly. Existing numeric TCP addresses and path-like Unix socket addresses remain supported. If neither flag nor config is provided, the client uses `127.0.0.1:6667`.
 
@@ -84,6 +84,8 @@ If you used the Linux installer script, wrapper commands are available: `rpc` (s
 
 ## Authentication
 
-For each operation, the client first signs a fresh client nonce, the protocol version, operation, and client public key. The server verifies this proof of private-key possession before it issues a random challenge. The challenge expires after 30 seconds. The client signs the challenge and operation payload, and the server consumes the challenge once. A captured request cannot authorize another operation or replay the same clipboard update.
+For each operation, the server checks the requested client key against the authorization file and returns a signed, self-contained challenge. The challenge binds the protocol version, operation, canonical client fingerprint, random nonce, and server issue and expiry times. The client verifies the challenge with `server_ssh_pubkey`, then signs the complete challenge and operation payload. The server verifies both signatures and consumes the nonce once. Challenge requests do not allocate pending server state, and a captured operation cannot authorize another operation or replay the same clipboard update.
 
-For `get`, the server encrypts the clipboard to the client key and signs the response with its private key. For `set`, the server signs the successful result and binds it to the client's identity, challenge, and ciphertext. The client verifies either success response against `server_ssh_pubkey` before it prints data or exits successfully. Protocol version 4 changes the RPC schema, so version 4 clients require a version 4 server.
+For `get`, the server encrypts the clipboard to the client key and signs the response with its private key. For `set`, the server signs the successful result and binds it to the client's identity, challenge, and ciphertext. The client verifies either success response against `server_ssh_pubkey` before it prints data or exits successfully. Protocol version 5 changes the RPC schema, so version 5 clients require a version 5 server.
+
+The server limits itself to 64 open RPC channels, eight concurrent requests per channel, and a 15-second channel lifetime. RpClip targets loopback and SSH-forwarded use with short-lived clients. A peer that maintains an active connection flood can still deny service; restrict the listening address and SSH access at deployment time.
