@@ -10,7 +10,7 @@ pub struct AgeEncryptedBlob {
 #[tarpc::service]
 pub trait RpClip {
     // Client provides its OpenSSH public key line; server returns age-encrypted bytes
-    async fn get_clip(client_ssh_pubkey_line: String) -> AgeEncryptedBlob;
+    async fn get_clip(client_ssh_pubkey_line: String) -> Result<AgeEncryptedBlob, String>;
 
     // Client sends ciphertext encrypted for the server
     async fn set_clip(blob: AgeEncryptedBlob) -> Result<(), String>;

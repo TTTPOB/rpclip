@@ -245,10 +245,17 @@ async fn main() {
                 }
             };
 
-            let blob = client
-                .get_clip(context::current(), pubkey_line)
-                .await
-                .unwrap();
+            let blob = match client.get_clip(context::current(), pubkey_line).await {
+                Ok(Ok(blob)) => blob,
+                Ok(Err(e)) => {
+                    error!("Server failed to get clipboard: {}", e);
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    error!("Clipboard RPC failed: {}", e);
+                    std::process::exit(1);
+                }
+            };
 
             let plaintext = match decrypt_with_private_key_path(&ssh_priv, &blob.data) {
                 Ok(p) => p,

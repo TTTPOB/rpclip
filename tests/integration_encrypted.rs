@@ -36,7 +36,7 @@ impl RpClip for TestServer {
         self,
         _: context::Context,
         client_ssh_pubkey_line: String,
-    ) -> AgeEncryptedBlob {
+    ) -> Result<AgeEncryptedBlob, String> {
         let text = self.clipboard.get_text().await;
         let recipient =
             ssh::Recipient::from_str(&client_ssh_pubkey_line).expect("client pubkey parse");
@@ -47,7 +47,7 @@ impl RpClip for TestServer {
         use std::io::Write;
         writer.write_all(text.as_bytes()).expect("write");
         writer.finish().expect("finish");
-        AgeEncryptedBlob { ver: 1, data: out }
+        Ok(AgeEncryptedBlob { ver: 1, data: out })
     }
 
     async fn set_clip(self, _: context::Context, blob: AgeEncryptedBlob) -> Result<(), String> {
@@ -161,7 +161,8 @@ async fn encrypted_round_trip() {
     let blob = client
         .get_clip(context::current(), client_pub_line.clone())
         .await
-        .expect("get_clip");
+        .expect("get_clip RPC")
+        .expect("server get_clip");
 
     let key_bytes = std::fs::read(&client_key_path).expect("read client key");
     let identity = ssh::Identity::from_buffer(

@@ -34,15 +34,15 @@ impl RpClip for RpClipServer {
         self,
         _: context::Context,
         client_ssh_pubkey_line: String,
-    ) -> AgeEncryptedBlob {
+    ) -> Result<AgeEncryptedBlob, String> {
         let text = match self.clipboard.lock().await.get_text() {
             Ok(text) => {
                 info!("server got clipboard text (len={} bytes)", text.len());
                 text
             }
-            Err(_) => {
-                error!("server failed to open system clipboard");
-                String::from("server failed to open system clipboard")
+            Err(e) => {
+                error!("server failed to open system clipboard: {e}");
+                return Err(format!("failed to read system clipboard: {e}"));
             }
         };
 
@@ -51,10 +51,7 @@ impl RpClip for RpClipServer {
             Ok(r) => r,
             Err(e) => {
                 error!("invalid client ssh pubkey: {:?}", e);
-                return AgeEncryptedBlob {
-                    ver: 1,
-                    data: Vec::new(),
-                };
+                return Err(format!("invalid client SSH public key: {e:?}"));
             }
         };
         let recipients: Vec<&dyn age::Recipient> = vec![&recipient as &dyn age::Recipient];
@@ -62,29 +59,28 @@ impl RpClip for RpClipServer {
             Ok(e) => e,
             Err(e) => {
                 error!("encryptor error: {}", e);
-                return AgeEncryptedBlob {
-                    ver: 1,
-                    data: Vec::new(),
-                };
+                return Err(format!("failed to initialize clipboard encryption: {e}"));
             }
         };
         let mut out = Vec::new();
-        match encryptor.wrap_output(&mut out) {
-            Ok(mut writer) => {
-                use std::io::Write;
-                if let Err(e) = writer.write_all(text.as_bytes()) {
-                    error!("encrypt write error: {}", e);
-                }
-                if let Err(e) = writer.finish() {
-                    error!("encrypt finish error: {}", e);
-                }
-            }
+        let mut writer = match encryptor.wrap_output(&mut out) {
+            Ok(writer) => writer,
             Err(e) => {
                 error!("wrap_output error: {}", e);
+                return Err(format!("failed to initialize encrypted response: {e}"));
             }
+        };
+        use std::io::Write;
+        if let Err(e) = writer.write_all(text.as_bytes()) {
+            error!("encrypt write error: {}", e);
+            return Err(format!("failed to encrypt clipboard data: {e}"));
+        }
+        if let Err(e) = writer.finish() {
+            error!("encrypt finish error: {}", e);
+            return Err(format!("failed to finish clipboard encryption: {e}"));
         }
 
-        AgeEncryptedBlob { ver: 1, data: out }
+        Ok(AgeEncryptedBlob { ver: 1, data: out })
     }
 
     async fn set_clip(self, _: context::Context, blob: AgeEncryptedBlob) -> Result<(), String> {
