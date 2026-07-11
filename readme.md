@@ -4,11 +4,17 @@ RpClip is a Rust-based clipboard synchronization tool that lets you share clipbo
 
 ## Install
 
-You can:
-1. `cargo install --git https://github.com/tttpob/rpclip.git` (requires Rust toolchain)
-2. Download from Releases for your arch/platform
+On Windows, run this from PowerShell to install the latest server and client for the current user:
 
-### Or you are setting up linux client
+```pwsh
+& ([scriptblock]::Create((Invoke-RestMethod https://raw.githubusercontent.com/tttpob/rpclip/refs/heads/master/install_windows.ps1)))
+```
+
+The installer places both executables in `%LOCALAPPDATA%\Programs\RpClip\bin` and adds that directory to the user PATH. Pass `-Version v0.3.0`, `-InstallDir <PATH>`, or `-NoPathUpdate` when needed.
+
+You can also run `cargo install --git https://github.com/tttpob/rpclip.git` with a Rust toolchain, or download binaries from Releases.
+
+### Linux Client
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/tttpob/rpclip/refs/heads/master/install_linux_client.sh)
 ```
