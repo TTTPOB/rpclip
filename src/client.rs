@@ -5,8 +5,8 @@ use log::{error, info, warn};
 use rpclip::{AgeEncryptedBlob, RpClipClient};
 use serde::Deserialize;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::str::FromStr;
-use std::{io::BufRead, net::SocketAddr};
 use tarpc::{client, context, tokio_serde::formats::Bincode};
 
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -262,13 +262,12 @@ async fn main() {
             print!("{}", text);
         }
         Commands::Set => {
-            // Read stdin
-            let content: Vec<String> = std::io::stdin()
-                .lock()
-                .lines()
-                .map(|line| line.unwrap())
-                .collect();
-            let text = content.join("\n");
+            use std::io::Read;
+            let mut text = String::new();
+            if let Err(e) = std::io::stdin().lock().read_to_string(&mut text) {
+                error!("Failed to read stdin: {}", e);
+                std::process::exit(1);
+            }
 
             // Load server recipient from config
             let server_recipient = cfg

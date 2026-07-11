@@ -138,7 +138,7 @@ async fn encrypted_round_trip() {
     .spawn();
 
     // Encrypt a message to server and set
-    let plaintext = "hello integration\\nsecond line";
+    let plaintext = "hello integration\nsecond line\n";
     let recipient = ssh::Recipient::from_str(&server_pub_line).expect("server recipient");
     let recipients: Vec<&dyn age::Recipient> = vec![&recipient as &dyn age::Recipient];
     let encryptor = Encryptor::with_recipients(recipients.into_iter()).expect("encryptor");

@@ -25,8 +25,29 @@ pub mod line_end {
     const LINE_ENDING: &str = "\n";
 
     pub fn to_platform_line_ending(text: &str) -> String {
-        let lines: Vec<&str> = text.lines().collect();
-        let result = lines.join(LINE_ENDING);
-        result
+        text.replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\n', LINE_ENDING)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn preserves_trailing_line_ending() {
+            assert_eq!(
+                to_platform_line_ending("first\nsecond\n"),
+                format!("first{LINE_ENDING}second{LINE_ENDING}")
+            );
+        }
+
+        #[test]
+        fn preserves_empty_lines() {
+            assert_eq!(
+                to_platform_line_ending("first\r\n\r\nsecond\r"),
+                format!("first{LINE_ENDING}{LINE_ENDING}second{LINE_ENDING}")
+            );
+        }
     }
 }
