@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use tarpc;
 
 pub const PROTOCOL_VERSION: u8 = 2;
 
