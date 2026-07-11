@@ -59,13 +59,13 @@ The `get` command fetches the current clipboard content from the server (local w
 ## Configuration
 The client supports configuration through a file. By default it loads `~/.config/rpclip/config.yaml` (or pass `--config <PATH>`). The configuration should specify the server address and, for encryption, SSH key details:
 ```yaml
-server_addr: "127.0.0.1:6667"    # or a UNIX socket path on Linux
+server_addr: "tcp://127.0.0.1:6667"    # or unix:///tmp/rpclip.sock on Linux
 # Optional: client key paths used for `get` (defaults shown)
 ssh_key_path: "~/.ssh/id_ed25519"
 ssh_pubkey_path: "~/.ssh/id_ed25519.pub"
 # Required for `set`: server's SSH public key (OpenSSH one-line format)
 server_ssh_pubkey: "ssh-ed25519 AAAAC3... user@host"
 ```
-You can also pass `--server <IP:PORT or UNIX SOCKET PATH>` to override `server_addr`. If neither flag nor config is provided, the client uses `127.0.0.1:6667`.
+You can also pass `--server <ADDRESS>` to override `server_addr`. Use `tcp://HOST:PORT` or `unix://PATH` to select the transport explicitly. Existing numeric TCP addresses and path-like Unix socket addresses remain supported. If neither flag nor config is provided, the client uses `127.0.0.1:6667`.
 
 If you used the Linux installer script, wrapper commands are available: `rpc` (send/set) and `rpp` (receive/get).

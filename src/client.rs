@@ -5,7 +5,6 @@ use log::{error, info, warn};
 use rpclip::{AgeEncryptedBlob, RpClipClient, PROTOCOL_VERSION};
 use serde::Deserialize;
 use std::future::Future;
-use std::net::SocketAddr;
 use std::str::FromStr;
 use tarpc::{client, context, tokio_serde::formats::Bincode};
 
@@ -38,30 +37,43 @@ struct Config {
     server_ssh_pubkey: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum ListenAddr {
-    Tcp(SocketAddr),
+    Tcp(String),
     #[cfg(unix)]
     Unix(std::path::PathBuf),
 }
 
-impl From<String> for ListenAddr {
-    fn from(addr: String) -> Self {
-        match addr.parse() {
-            Ok(addr) => ListenAddr::Tcp(addr),
-            Err(_) => {
-                #[cfg(unix)]
-                {
-                    ListenAddr::Unix(addr.into())
-                }
-                #[cfg(not(unix))]
-                {
-                    error!("Unix domain sockets are not supported on this platform");
-                    std::process::exit(1);
-                }
+fn parse_listen_addr(addr: String) -> Result<ListenAddr, String> {
+    if let Some(tcp_addr) = addr.strip_prefix("tcp://") {
+        if tcp_addr.is_empty() {
+            return Err("TCP server address cannot be empty".to_string());
+        }
+        return Ok(ListenAddr::Tcp(tcp_addr.to_string()));
+    }
+
+    let unix_path = addr.strip_prefix("unix://");
+    let is_path = unix_path.is_some()
+        || addr.starts_with('/')
+        || addr.starts_with("./")
+        || addr.starts_with("../")
+        || addr.starts_with("~/");
+    if is_path {
+        #[cfg(unix)]
+        {
+            let path = unix_path.unwrap_or(&addr);
+            if path.is_empty() {
+                return Err("Unix socket path cannot be empty".to_string());
             }
+            return Ok(ListenAddr::Unix(expand_tilde(path).into()));
+        }
+        #[cfg(not(unix))]
+        {
+            return Err("Unix domain sockets are not supported on this platform".to_string());
         }
     }
+
+    Ok(ListenAddr::Tcp(addr))
 }
 
 async fn from_listen_addr(addr: ListenAddr) -> RpClipClient {
@@ -203,7 +215,10 @@ async fn main() {
             }
         }
     };
-    let server: ListenAddr = server.into();
+    let server = parse_listen_addr(server).unwrap_or_else(|e| {
+        error!("Invalid server address: {}", e);
+        std::process::exit(1);
+    });
     info!("Connecting to server at {:?}", server);
     let client = from_listen_addr(server).await;
 
@@ -329,5 +344,30 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error, "connection attempt timed out after 1ms");
+    }
+
+    #[test]
+    fn parses_tcp_addresses_and_hostnames() {
+        assert_eq!(
+            parse_listen_addr("127.0.0.1:6667".to_string()).unwrap(),
+            ListenAddr::Tcp("127.0.0.1:6667".to_string())
+        );
+        assert_eq!(
+            parse_listen_addr("tcp://localhost:6667".to_string()).unwrap(),
+            ListenAddr::Tcp("localhost:6667".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_explicit_and_path_like_unix_addresses() {
+        assert_eq!(
+            parse_listen_addr("unix:///tmp/rpclip.sock".to_string()).unwrap(),
+            ListenAddr::Unix("/tmp/rpclip.sock".into())
+        );
+        assert_eq!(
+            parse_listen_addr("./rpclip.sock".to_string()).unwrap(),
+            ListenAddr::Unix("./rpclip.sock".into())
+        );
     }
 }
