@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 #[derive(Parser)]
 struct Args {
     #[arg(short, long, value_name = "IP:PORT", required = true)]
-    address: Option<String>,
+    address: Vec<SocketAddr>,
     /// Path to server's SSH private key (OpenSSH format). Defaults to ~/.ssh/id_ed25519
     #[arg(long)]
     ssh_key_path: Option<String>,
@@ -163,25 +163,21 @@ async fn main() {
     env_logger::init();
     // Parse command line arguments
     let args = Args::parse();
-    let listen_addr: SocketAddr = match args.address {
-        Some(addr) => addr.parse().expect("Invalid address"),
-        None => {
-            info!("No address provided, using default address");
-            "[::1]:6667".parse().expect("Invalid address")
-        }
-    };
-
-    let listener = tarpc::serde_transport::tcp::listen(&listen_addr, Bincode::default)
-        .await
-        .unwrap();
-    info!("Listening on: {}", listen_addr);
+    let mut listeners = Vec::with_capacity(args.address.len());
+    for listen_addr in args.address {
+        let listener = tarpc::serde_transport::tcp::listen(&listen_addr, Bincode::default)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to listen on {listen_addr}: {e}"));
+        info!("Listening on: {}", listen_addr);
+        listeners.push(listener);
+    }
 
     let clipboard = Arc::new(Mutex::new(Clipboard::new().unwrap()));
     let ssh_key_path = args
         .ssh_key_path
         .unwrap_or_else(|| "~/.ssh/id_ed25519".to_string());
     info!("Clipboard server started");
-    listener
+    futures::stream::select_all(listeners)
         .filter_map(|r| future::ready(r.ok()))
         .map(server::BaseChannel::with_defaults)
         .map(|channel| {
@@ -197,4 +193,29 @@ async fn main() {
         .buffer_unordered(10)
         .for_each(|_| async {}) // discard the result of the `map`
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_multiple_listen_addresses() {
+        let args = Args::try_parse_from([
+            "rpclip-server",
+            "--address",
+            "127.0.0.1:6667",
+            "--address",
+            "[::1]:6667",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.address,
+            [
+                "127.0.0.1:6667".parse().unwrap(),
+                "[::1]:6667".parse().unwrap(),
+            ]
+        );
+    }
 }
