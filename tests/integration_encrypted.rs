@@ -4,7 +4,7 @@ use std::time::Duration;
 use age::ssh;
 use age::{Decryptor, Encryptor};
 use futures::StreamExt;
-use rpclip::{AgeEncryptedBlob, RpClip, RpClipClient};
+use rpclip::{AgeEncryptedBlob, RpClip, RpClipClient, PROTOCOL_VERSION};
 use ssh_key::{Algorithm, LineEnding, PrivateKey};
 use tarpc::server::Channel;
 use tarpc::{client, context, tokio_serde::formats::Bincode};
@@ -47,10 +47,15 @@ impl RpClip for TestServer {
         use std::io::Write;
         writer.write_all(text.as_bytes()).expect("write");
         writer.finish().expect("finish");
-        Ok(AgeEncryptedBlob { ver: 1, data: out })
+        Ok(AgeEncryptedBlob {
+            ver: PROTOCOL_VERSION,
+            data: out,
+        })
     }
 
     async fn set_clip(self, _: context::Context, blob: AgeEncryptedBlob) -> Result<(), String> {
+        blob.validate_version()?;
+
         let key_bytes = std::fs::read(&self.ssh_key_path).expect("read server key");
         let identity = ssh::Identity::from_buffer(
             std::io::Cursor::new(key_bytes),
@@ -147,7 +152,10 @@ async fn encrypted_round_trip() {
     use std::io::Write;
     writer.write_all(plaintext.as_bytes()).expect("write");
     writer.finish().expect("finish");
-    let blob = AgeEncryptedBlob { ver: 1, data: out };
+    let blob = AgeEncryptedBlob {
+        ver: PROTOCOL_VERSION,
+        data: out,
+    };
     client
         .set_clip(context::current(), blob)
         .await

@@ -1,10 +1,25 @@
 use serde::{Deserialize, Serialize};
 use tarpc;
 
+pub const PROTOCOL_VERSION: u8 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgeEncryptedBlob {
     pub ver: u8,
     pub data: Vec<u8>,
+}
+
+impl AgeEncryptedBlob {
+    pub fn validate_version(&self) -> Result<(), String> {
+        if self.ver == PROTOCOL_VERSION {
+            Ok(())
+        } else {
+            Err(format!(
+                "unsupported protocol version {}; expected {}",
+                self.ver, PROTOCOL_VERSION
+            ))
+        }
+    }
 }
 
 #[tarpc::service]
@@ -49,5 +64,28 @@ pub mod line_end {
                 format!("first{LINE_ENDING}{LINE_ENDING}second{LINE_ENDING}")
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_encrypted_blob_version() {
+        let supported = AgeEncryptedBlob {
+            ver: PROTOCOL_VERSION,
+            data: Vec::new(),
+        };
+        let unsupported = AgeEncryptedBlob {
+            ver: PROTOCOL_VERSION + 1,
+            data: Vec::new(),
+        };
+
+        assert_eq!(supported.validate_version(), Ok(()));
+        assert_eq!(
+            unsupported.validate_version(),
+            Err("unsupported protocol version 2; expected 1".to_string())
+        );
     }
 }

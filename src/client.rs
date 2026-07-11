@@ -2,7 +2,7 @@ use age::ssh;
 use age::{Decryptor, Encryptor};
 use clap::{Parser, Subcommand};
 use log::{error, info, warn};
-use rpclip::{AgeEncryptedBlob, RpClipClient};
+use rpclip::{AgeEncryptedBlob, RpClipClient, PROTOCOL_VERSION};
 use serde::Deserialize;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -256,6 +256,10 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
+            if let Err(e) = blob.validate_version() {
+                error!("Server returned incompatible clipboard data: {}", e);
+                std::process::exit(1);
+            }
 
             let plaintext = match decrypt_with_private_key_path(&ssh_priv, &blob.data) {
                 Ok(p) => p,
@@ -294,7 +298,7 @@ async fn main() {
             };
 
             let blob = AgeEncryptedBlob {
-                ver: 1,
+                ver: PROTOCOL_VERSION,
                 data: ciphertext,
             };
             match client.set_clip(context::current(), blob).await {

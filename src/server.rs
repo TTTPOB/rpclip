@@ -4,7 +4,7 @@ use arboard::Clipboard;
 use clap::Parser;
 use futures::prelude::*;
 use log::{error, info};
-use rpclip::{AgeEncryptedBlob, RpClip};
+use rpclip::{AgeEncryptedBlob, RpClip, PROTOCOL_VERSION};
 use std::str::FromStr;
 use std::{net::SocketAddr, sync::Arc};
 use tarpc::{
@@ -80,10 +80,15 @@ impl RpClip for RpClipServer {
             return Err(format!("failed to finish clipboard encryption: {e}"));
         }
 
-        Ok(AgeEncryptedBlob { ver: 1, data: out })
+        Ok(AgeEncryptedBlob {
+            ver: PROTOCOL_VERSION,
+            data: out,
+        })
     }
 
     async fn set_clip(self, _: context::Context, blob: AgeEncryptedBlob) -> Result<(), String> {
+        blob.validate_version()?;
+
         // Decrypt with server's SSH private key
         let key_path = expand_tilde(&self.ssh_key_path);
         let key_bytes = match std::fs::read(&key_path) {
