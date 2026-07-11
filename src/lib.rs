@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tarpc;
 
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgeEncryptedBlob {
@@ -85,7 +85,11 @@ mod tests {
         assert_eq!(supported.validate_version(), Ok(()));
         assert_eq!(
             unsupported.validate_version(),
-            Err("unsupported protocol version 2; expected 1".to_string())
+            Err(format!(
+                "unsupported protocol version {}; expected {}",
+                PROTOCOL_VERSION + 1,
+                PROTOCOL_VERSION
+            ))
         );
     }
 }
