@@ -409,6 +409,123 @@ impl AuthorizedClients {
             Err("client SSH public key is not authorized".to_string())
         }
     }
+
+    fn fingerprints(&self) -> impl Iterator<Item = String> + '_ {
+        self.keys
+            .iter()
+            .map(|key| key.fingerprint(HashAlg::Sha256).to_string())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RateLimitConfig {
+    global_capacity: u32,
+    global_refill_per_second: f64,
+    client_capacity: u32,
+    client_refill_per_second: f64,
+}
+
+const CHALLENGE_RATE_LIMIT: RateLimitConfig = RateLimitConfig {
+    global_capacity: 32,
+    global_refill_per_second: 8.0,
+    client_capacity: 4,
+    client_refill_per_second: 1.0,
+};
+
+struct TokenBucket {
+    tokens: f64,
+    capacity: f64,
+    refill_per_second: f64,
+    last_refill: std::time::Instant,
+}
+
+impl TokenBucket {
+    fn new(capacity: u32, refill_per_second: f64, now: std::time::Instant) -> Self {
+        Self {
+            tokens: capacity as f64,
+            capacity: capacity as f64,
+            refill_per_second,
+            last_refill: now,
+        }
+    }
+
+    fn refill(&mut self, now: std::time::Instant) {
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        self.tokens =
+            (self.tokens + elapsed.as_secs_f64() * self.refill_per_second).min(self.capacity);
+        self.last_refill = now;
+    }
+
+    fn has_token(&self) -> bool {
+        self.tokens >= 1.0
+    }
+
+    fn consume(&mut self) {
+        self.tokens -= 1.0;
+    }
+}
+
+struct ChallengeRateState {
+    global: TokenBucket,
+    clients: HashMap<String, TokenBucket>,
+}
+
+struct ChallengeRateLimiter {
+    state: Mutex<ChallengeRateState>,
+}
+
+impl ChallengeRateLimiter {
+    fn new(
+        fingerprints: impl IntoIterator<Item = String>,
+        config: RateLimitConfig,
+        now: std::time::Instant,
+    ) -> Self {
+        let clients = fingerprints
+            .into_iter()
+            .map(|fingerprint| {
+                (
+                    fingerprint,
+                    TokenBucket::new(config.client_capacity, config.client_refill_per_second, now),
+                )
+            })
+            .collect();
+        Self {
+            state: Mutex::new(ChallengeRateState {
+                global: TokenBucket::new(
+                    config.global_capacity,
+                    config.global_refill_per_second,
+                    now,
+                ),
+                clients,
+            }),
+        }
+    }
+
+    fn check(&self, fingerprint: &str) -> Result<(), String> {
+        self.check_at(fingerprint, std::time::Instant::now())
+    }
+
+    fn check_at(&self, fingerprint: &str, now: std::time::Instant) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "challenge rate limiter lock is poisoned".to_string())?;
+        let ChallengeRateState { global, clients } = &mut *state;
+        global.refill(now);
+        let client = clients
+            .get_mut(fingerprint)
+            .ok_or_else(|| "client SSH public key has no challenge rate bucket".to_string())?;
+        client.refill(now);
+        if !client.has_token() {
+            return Err("challenge rate limit exceeded for client key".to_string());
+        }
+        if !global.has_token() {
+            return Err("global challenge rate limit exceeded".to_string());
+        }
+        client.consume();
+        global.consume();
+        Ok(())
+    }
 }
 
 pub struct ChallengeStore {
@@ -455,6 +572,9 @@ pub struct ServerAuthenticator {
     private_key: Arc<PrivateKey>,
     authorized_clients: Arc<AuthorizedClients>,
     challenges: Arc<ChallengeStore>,
+    challenge_rate_limiter: Arc<ChallengeRateLimiter>,
+    #[cfg(test)]
+    challenge_signature_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ServerAuthenticator {
@@ -466,10 +586,18 @@ impl ServerAuthenticator {
         if private_key.algorithm() != Algorithm::Ed25519 {
             return Err("server SSH private key must use Ed25519".to_string());
         }
+        let challenge_rate_limiter = Arc::new(ChallengeRateLimiter::new(
+            authorized_clients.fingerprints(),
+            CHALLENGE_RATE_LIMIT,
+            std::time::Instant::now(),
+        ));
         Ok(Self {
             private_key,
             authorized_clients,
             challenges,
+            challenge_rate_limiter,
+            #[cfg(test)]
+            challenge_signature_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -477,11 +605,13 @@ impl ServerAuthenticator {
         request.validate_version()?;
         let public_key = parse_public_key(&request.client_ssh_pubkey)?;
         self.authorized_clients.authorize(&public_key)?;
+        let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
+        self.challenge_rate_limiter.check(&fingerprint)?;
         let now = unix_time_seconds()?;
         let mut challenge = Challenge {
             ver: PROTOCOL_VERSION,
             operation: request.operation,
-            client_fingerprint: public_key.fingerprint(HashAlg::Sha256).to_string(),
+            client_fingerprint: fingerprint,
             nonce: [0; 32],
             issued_at_unix_seconds: now,
             expires_at_unix_seconds: now + CHALLENGE_TTL.as_secs(),
@@ -489,8 +619,17 @@ impl ServerAuthenticator {
         };
         OsRng.fill_bytes(&mut challenge.nonce);
         let message = challenge_signing_bytes(&challenge)?;
+        #[cfg(test)]
+        self.challenge_signature_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         challenge.signature = sign(&self.private_key, CHALLENGE_SIGNATURE_NAMESPACE, &message)?;
         Ok(challenge)
+    }
+
+    #[cfg(test)]
+    fn challenge_signature_count(&self) -> usize {
+        self.challenge_signature_count
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn authenticate_get(&self, request: &AuthRequest) -> Result<PublicKey, String> {
@@ -597,13 +736,17 @@ mod tests {
     }
 
     fn authorized_clients(key: &PrivateKey) -> Arc<AuthorizedClients> {
+        authorized_clients_for(&[key])
+    }
+
+    fn authorized_clients_for(keys: &[&PrivateKey]) -> Arc<AuthorizedClients> {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("authorized_keys");
-        std::fs::write(
-            &path,
-            format!("{} client\n", key.public_key().to_openssh().unwrap()),
-        )
-        .expect("write authorized keys");
+        let contents = keys
+            .iter()
+            .map(|key| format!("{} client\n", key.public_key().to_openssh().unwrap()))
+            .collect::<String>();
+        std::fs::write(&path, contents).expect("write authorized keys");
         Arc::new(AuthorizedClients::read_file(&path).expect("authorized clients"))
     }
 
@@ -640,6 +783,80 @@ mod tests {
             authorized.authorize(other.public_key()),
             Err("client SSH public key is not authorized".to_string())
         );
+    }
+
+    #[test]
+    fn challenge_rate_limiter_enforces_burst_and_refill() {
+        let now = std::time::Instant::now();
+        let limiter = ChallengeRateLimiter::new(
+            ["client-a".to_string()],
+            RateLimitConfig {
+                global_capacity: 10,
+                global_refill_per_second: 10.0,
+                client_capacity: 2,
+                client_refill_per_second: 1.0,
+            },
+            now,
+        );
+
+        assert!(limiter.check_at("client-a", now).is_ok());
+        assert!(limiter.check_at("client-a", now).is_ok());
+        assert_eq!(
+            limiter.check_at("client-a", now),
+            Err("challenge rate limit exceeded for client key".to_string())
+        );
+        assert!(limiter
+            .check_at("client-a", now + Duration::from_secs(1))
+            .is_ok());
+    }
+
+    #[test]
+    fn client_rate_buckets_are_isolated_but_share_global_limit() {
+        let now = std::time::Instant::now();
+        let limiter = ChallengeRateLimiter::new(
+            ["client-a".to_string(), "client-b".to_string()],
+            RateLimitConfig {
+                global_capacity: 3,
+                global_refill_per_second: 0.0,
+                client_capacity: 2,
+                client_refill_per_second: 0.0,
+            },
+            now,
+        );
+
+        assert!(limiter.check_at("client-a", now).is_ok());
+        assert!(limiter.check_at("client-a", now).is_ok());
+        assert!(limiter.check_at("client-a", now).is_err());
+        assert!(limiter.check_at("client-b", now).is_ok());
+        assert_eq!(
+            limiter.check_at("client-b", now),
+            Err("global challenge rate limit exceeded".to_string())
+        );
+    }
+
+    #[test]
+    fn challenge_rate_check_is_atomic_under_concurrency() {
+        let now = std::time::Instant::now();
+        let limiter = Arc::new(ChallengeRateLimiter::new(
+            ["client".to_string()],
+            RateLimitConfig {
+                global_capacity: 1,
+                global_refill_per_second: 0.0,
+                client_capacity: 1,
+                client_refill_per_second: 0.0,
+            },
+            now,
+        ));
+        let successes = (0..8)
+            .map(|_| {
+                let limiter = limiter.clone();
+                std::thread::spawn(move || limiter.check_at("client", now))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|thread| thread.join().unwrap().ok())
+            .count();
+        assert_eq!(successes, 1);
     }
 
     #[test]
@@ -736,11 +953,6 @@ mod tests {
         let mut challenge = authenticator
             .issue_challenge(&request)
             .expect("issue challenge");
-        for _ in 0..100 {
-            authenticator
-                .issue_challenge(&request)
-                .expect("issue stateless challenge");
-        }
         assert_eq!(authenticator.challenges.len(), 0);
         assert!(verify_server_challenge(
             server.public_key(),
@@ -772,6 +984,30 @@ mod tests {
             ClipboardOperation::Get,
         )
         .is_err());
+    }
+
+    #[test]
+    fn rate_limited_challenge_request_skips_signature_work() {
+        let client = keypair();
+        let server = keypair();
+        let authenticator = authenticator(&client, &server);
+        let request = make_challenge_request(
+            client.public_key().to_openssh().unwrap(),
+            ClipboardOperation::Get,
+        );
+
+        for _ in 0..CHALLENGE_RATE_LIMIT.client_capacity {
+            authenticator.issue_challenge(&request).unwrap();
+        }
+        assert_eq!(
+            authenticator.issue_challenge(&request).unwrap_err(),
+            "challenge rate limit exceeded for client key"
+        );
+        assert_eq!(
+            authenticator.challenge_signature_count(),
+            CHALLENGE_RATE_LIMIT.client_capacity as usize
+        );
+        assert_eq!(authenticator.challenges.len(), 0);
     }
 
     #[test]
