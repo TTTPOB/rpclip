@@ -4,9 +4,12 @@ use clap::{Parser, Subcommand};
 use log::{error, info, warn};
 use rpclip::{AgeEncryptedBlob, RpClipClient};
 use serde::Deserialize;
+use std::future::Future;
 use std::str::FromStr;
 use std::{io::BufRead, net::SocketAddr};
 use tarpc::{client, context, tokio_serde::formats::Bincode};
+
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Parser)]
 struct Args {
@@ -65,26 +68,45 @@ async fn from_listen_addr(addr: ListenAddr) -> RpClipClient {
     match addr {
         ListenAddr::Tcp(addr) => RpClipClient::new(
             client::Config::default(),
-            tarpc::serde_transport::tcp::connect(addr, Bincode::default)
-                .await
-                .unwrap_or_else(|e| {
-                    error!("Unable to connect to server: {}", e);
-                    std::process::exit(1);
-                }),
+            connect_with_timeout(
+                tarpc::serde_transport::tcp::connect(addr, Bincode::default),
+                CONNECT_TIMEOUT,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                error!("Unable to connect to server: {}", e);
+                std::process::exit(1);
+            }),
         )
         .spawn(),
         #[cfg(unix)]
         ListenAddr::Unix(path) => RpClipClient::new(
             client::Config::default(),
-            tarpc::serde_transport::unix::connect(path, Bincode::default)
-                .await
-                .unwrap_or_else(|e| {
-                    error!("Unable to connect to server: {}", e);
-                    std::process::exit(1);
-                }),
+            connect_with_timeout(
+                tarpc::serde_transport::unix::connect(path, Bincode::default),
+                CONNECT_TIMEOUT,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                error!("Unable to connect to server: {}", e);
+                std::process::exit(1);
+            }),
         )
         .spawn(),
     }
+}
+
+async fn connect_with_timeout<T, E>(
+    connect: impl Future<Output = Result<T, E>>,
+    timeout: std::time::Duration,
+) -> Result<T, String>
+where
+    E: std::fmt::Display,
+{
+    tokio::time::timeout(timeout, connect)
+        .await
+        .map_err(|_| format!("connection attempt timed out after {timeout:?}"))?
+        .map_err(|e| e.to_string())
 }
 
 fn expand_tilde(path: &str) -> String {
@@ -281,5 +303,21 @@ async fn main() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn connection_attempt_times_out() {
+        let connect = std::future::pending::<Result<(), std::io::Error>>();
+
+        let error = connect_with_timeout(connect, std::time::Duration::from_millis(1))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "connection attempt timed out after 1ms");
     }
 }
