@@ -373,7 +373,7 @@ fn load_server_security(
         Arc::new(private_key),
         Arc::new(authorized_clients),
         Arc::new(ChallengeStore::new(CHALLENGE_TTL)),
-    );
+    )?;
     Ok((ssh_key_path, Arc::new(authenticator)))
 }
 

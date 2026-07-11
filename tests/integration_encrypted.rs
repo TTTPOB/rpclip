@@ -161,11 +161,14 @@ async fn encrypted_round_trip() {
     let authorized_clients = Arc::new(
         AuthorizedClients::read_file(&authorized_keys_path).expect("read authorized clients"),
     );
-    let authenticator = Arc::new(ServerAuthenticator::new(
-        server_private_key.clone(),
-        authorized_clients,
-        Arc::new(ChallengeStore::default()),
-    ));
+    let authenticator = Arc::new(
+        ServerAuthenticator::new(
+            server_private_key.clone(),
+            authorized_clients,
+            Arc::new(ChallengeStore::default()),
+        )
+        .expect("server authenticator"),
+    );
 
     // Random port
     let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 0");

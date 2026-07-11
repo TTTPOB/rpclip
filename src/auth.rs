@@ -540,12 +540,15 @@ impl ServerAuthenticator {
         private_key: Arc<PrivateKey>,
         authorized_clients: Arc<AuthorizedClients>,
         challenges: Arc<ChallengeStore>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, String> {
+        if private_key.algorithm() != Algorithm::Ed25519 {
+            return Err("server SSH private key must use Ed25519".to_string());
+        }
+        Ok(Self {
             private_key,
             authorized_clients,
             challenges,
-        }
+        })
     }
 
     pub fn issue_challenge(&self, request: &ChallengeRequest) -> Result<Challenge, String> {
@@ -634,6 +637,7 @@ mod tests {
             authorized_clients(client),
             Arc::new(ChallengeStore::default()),
         )
+        .expect("server authenticator")
     }
 
     #[test]
@@ -952,5 +956,13 @@ mod tests {
 
         let error = read_server_private_key(&path).expect_err("RSA server key should be rejected");
         assert!(error.contains("must use Ed25519"));
+
+        let client = keypair();
+        assert!(ServerAuthenticator::new(
+            Arc::new(rsa),
+            authorized_clients(&client),
+            Arc::new(ChallengeStore::default()),
+        )
+        .is_err());
     }
 }
