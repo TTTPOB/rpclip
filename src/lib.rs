@@ -1,5 +1,5 @@
-use tarpc;
 use serde::{Deserialize, Serialize};
+use tarpc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgeEncryptedBlob {

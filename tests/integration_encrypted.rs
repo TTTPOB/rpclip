@@ -1,22 +1,28 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use age::{Decryptor, Encryptor};
 use age::ssh;
+use age::{Decryptor, Encryptor};
+use futures::StreamExt;
 use rpclip::{AgeEncryptedBlob, RpClip, RpClipClient};
 use ssh_key::{Algorithm, LineEnding, PrivateKey};
-use tarpc::{client, context, tokio_serde::formats::Bincode};
 use tarpc::server::Channel;
-use futures::StreamExt;
+use tarpc::{client, context, tokio_serde::formats::Bincode};
 use tokio::task::JoinHandle;
 
 // Minimal clipboard for tests (avoids system clipboard)
 #[derive(Default, Clone)]
 struct TestClipboard(std::sync::Arc<tokio::sync::Mutex<String>>);
 impl TestClipboard {
-    fn new() -> Self { Self(Default::default()) }
-    async fn get_text(&self) -> String { self.0.lock().await.clone() }
-    async fn set_text(&self, text: String) { *self.0.lock().await = text; }
+    fn new() -> Self {
+        Self(Default::default())
+    }
+    async fn get_text(&self) -> String {
+        self.0.lock().await.clone()
+    }
+    async fn set_text(&self, text: String) {
+        *self.0.lock().await = text;
+    }
 }
 
 #[derive(Clone)]
@@ -26,9 +32,14 @@ struct TestServer {
 }
 
 impl RpClip for TestServer {
-    async fn get_clip(self, _: context::Context, client_ssh_pubkey_line: String) -> AgeEncryptedBlob {
+    async fn get_clip(
+        self,
+        _: context::Context,
+        client_ssh_pubkey_line: String,
+    ) -> AgeEncryptedBlob {
         let text = self.clipboard.get_text().await;
-        let recipient = ssh::Recipient::from_str(&client_ssh_pubkey_line).expect("client pubkey parse");
+        let recipient =
+            ssh::Recipient::from_str(&client_ssh_pubkey_line).expect("client pubkey parse");
         let recipients: Vec<&dyn age::Recipient> = vec![&recipient as &dyn age::Recipient];
         let encryptor = Encryptor::with_recipients(recipients.into_iter()).expect("encryptor");
         let mut out = Vec::new();
@@ -41,8 +52,11 @@ impl RpClip for TestServer {
 
     async fn set_clip(self, _: context::Context, blob: AgeEncryptedBlob) {
         let key_bytes = std::fs::read(&self.ssh_key_path).expect("read server key");
-        let identity = ssh::Identity::from_buffer(std::io::Cursor::new(key_bytes), Some(self.ssh_key_path.clone()))
-            .expect("identity parse");
+        let identity = ssh::Identity::from_buffer(
+            std::io::Cursor::new(key_bytes),
+            Some(self.ssh_key_path.clone()),
+        )
+        .expect("identity parse");
         let decryptor = Decryptor::new(&blob.data[..]).expect("decryptor");
         let mut reader = decryptor
             .decrypt(std::iter::once(&identity as &dyn age::Identity))
@@ -57,7 +71,11 @@ impl RpClip for TestServer {
     }
 }
 
-async fn start_test_server(addr: std::net::SocketAddr, ssh_key_path: String, clipboard: TestClipboard) -> JoinHandle<()> {
+async fn start_test_server(
+    addr: std::net::SocketAddr,
+    ssh_key_path: String,
+    clipboard: TestClipboard,
+) -> JoinHandle<()> {
     let listener = tarpc::serde_transport::tcp::listen(&addr, Bincode::default)
         .await
         .expect("listen");
@@ -66,7 +84,10 @@ async fn start_test_server(addr: std::net::SocketAddr, ssh_key_path: String, cli
             .filter_map(|r| futures::future::ready(r.ok()))
             .map(tarpc::server::BaseChannel::with_defaults)
             .map(|channel| {
-                let rpserver = TestServer { clipboard: clipboard.clone(), ssh_key_path: ssh_key_path.clone() };
+                let rpserver = TestServer {
+                    clipboard: clipboard.clone(),
+                    ssh_key_path: ssh_key_path.clone(),
+                };
                 channel.execute(rpserver.serve()).for_each(|x| async {
                     tokio::spawn(x);
                 })
@@ -126,7 +147,10 @@ async fn encrypted_round_trip() {
     writer.write_all(plaintext.as_bytes()).expect("write");
     writer.finish().expect("finish");
     let blob = AgeEncryptedBlob { ver: 1, data: out };
-    client.set_clip(context::current(), blob).await.expect("set_clip");
+    client
+        .set_clip(context::current(), blob)
+        .await
+        .expect("set_clip");
 
     // Give the server a moment to process
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -138,8 +162,11 @@ async fn encrypted_round_trip() {
         .expect("get_clip");
 
     let key_bytes = std::fs::read(&client_key_path).expect("read client key");
-    let identity = ssh::Identity::from_buffer(std::io::Cursor::new(key_bytes), Some(client_key_path.clone()))
-        .expect("identity parse");
+    let identity = ssh::Identity::from_buffer(
+        std::io::Cursor::new(key_bytes),
+        Some(client_key_path.clone()),
+    )
+    .expect("identity parse");
     let decryptor = Decryptor::new(&blob.data[..]).expect("decryptor");
     let mut reader = decryptor
         .decrypt(std::iter::once(&identity as &dyn age::Identity))

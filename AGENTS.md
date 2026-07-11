@@ -1,5 +1,11 @@
 # Repository Instructions
 
+## Git Hooks
+
+- This repository stores hooks in `.githooks`.
+- Configure a new clone with `git config core.hooksPath .githooks`.
+- The pre-commit hook requires `cargo fmt --all -- --check` to pass.
+
 ## Version Bumps and Releases
 
 - Keep version bumps in a separate commit after the related feature or fix commits.
