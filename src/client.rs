@@ -9,6 +9,7 @@ use rpclip::{
 use serde::Deserialize;
 use ssh_key::{PrivateKey, PublicKey};
 use std::future::Future;
+use std::io::Read;
 use std::path::Path;
 use std::str::FromStr;
 use tarpc::{client, context, tokio_serde::formats::Bincode};
@@ -56,6 +57,17 @@ struct ClientCredentials {
     public_key_line: String,
     server_public_key_line: String,
     server_public_key: PublicKey,
+}
+
+enum PreparedCommand {
+    Get,
+    Set(AgeEncryptedBlob),
+}
+
+struct PreparedClient {
+    server: ListenAddr,
+    credentials: ClientCredentials,
+    command: PreparedCommand,
 }
 
 fn parse_listen_addr(addr: String) -> Result<ListenAddr, String> {
@@ -228,6 +240,66 @@ fn encrypt_to_pubkey_line(pubkey_line: &str, plaintext: &[u8]) -> Result<Vec<u8>
     Ok(out)
 }
 
+fn load_config(config_path: Option<&str>) -> Result<Option<Config>, String> {
+    let path = match config_path {
+        Some(path) => Some(std::path::PathBuf::from(expand_tilde(path))),
+        None => dirs::config_dir().map(|dir| dir.join("rpclip").join("config.yaml")),
+    };
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    if config_path.is_none() && !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read config {}: {e}", path.display()))?;
+    serde_yaml::from_str(&content)
+        .map(Some)
+        .map_err(|e| format!("parse config {}: {e}", path.display()))
+}
+
+fn prepare_client(args: Args, stdin: &mut impl Read) -> Result<PreparedClient, String> {
+    let config = load_config(args.config.as_deref())?;
+    let server_addr = match args.server {
+        Some(server) => {
+            info!("Using server address from command line");
+            server
+        }
+        None => config
+            .as_ref()
+            .map(|config| {
+                info!("Using server address from config file");
+                config.server_addr.clone()
+            })
+            .unwrap_or_else(|| {
+                warn!("No server address provided, using default server address");
+                "127.0.0.1:6667".to_string()
+            }),
+    };
+    let server = parse_listen_addr(server_addr)?;
+    let credentials = load_client_credentials(config.as_ref())?;
+    let command = match args.command {
+        Commands::Get => PreparedCommand::Get,
+        Commands::Set => {
+            let mut text = String::new();
+            stdin
+                .read_to_string(&mut text)
+                .map_err(|e| format!("read stdin: {e}"))?;
+            let ciphertext =
+                encrypt_to_pubkey_line(&credentials.server_public_key_line, text.as_bytes())?;
+            PreparedCommand::Set(AgeEncryptedBlob {
+                ver: PROTOCOL_VERSION,
+                data: ciphertext,
+            })
+        }
+    };
+    Ok(PreparedClient {
+        server,
+        credentials,
+        command,
+    })
+}
+
 fn decrypt_with_private_key_path(
     private_key_path: &str,
     ciphertext: &[u8],
@@ -256,65 +328,16 @@ fn decrypt_with_private_key_path(
 async fn main() {
     env_logger::init();
     let args = Args::parse();
-    let server = match (args.server.clone(), args.config.clone()) {
-        (Some(server), _) => {
-            info!("Using server address from command line");
-            server
-        }
-        (_, Some(config)) => {
-            info!("Using server address from config file");
-            let config: Config =
-                serde_yaml::from_str(&std::fs::read_to_string(config).unwrap()).unwrap();
-            config.server_addr
-        }
-        _ => {
-            info!("Both server address and config file not provided, using default config file");
-            let default_config_file = dirs::config_dir()
-                .unwrap()
-                .join("rpclip")
-                .join("config.yaml");
-            if default_config_file.exists() {
-                let config: Config =
-                    serde_yaml::from_str(&std::fs::read_to_string(default_config_file).unwrap())
-                        .unwrap();
-                config.server_addr
-            } else {
-                warn!("No server address provided, using default server address");
-                "127.0.0.1:6667".to_string()
-            }
-        }
-    };
-    let server = parse_listen_addr(server).unwrap_or_else(|e| {
-        error!("Invalid server address: {}", e);
+    let prepared = prepare_client(args, &mut std::io::stdin().lock()).unwrap_or_else(|e| {
+        error!("Failed to prepare client request: {e}");
         std::process::exit(1);
     });
-    info!("Connecting to server at {:?}", server);
-    let client = from_listen_addr(server).await;
+    info!("Connecting to server at {:?}", prepared.server);
+    let client = from_listen_addr(prepared.server).await;
+    let credentials = prepared.credentials;
 
-    // Load config again if available for crypto fields
-    let mut cfg: Option<Config> = None;
-    if let Some(config_path) = args.config {
-        let content = std::fs::read_to_string(&config_path).unwrap_or_default();
-        if !content.is_empty() {
-            cfg = serde_yaml::from_str(&content).ok();
-        }
-    } else {
-        let default_config_file = dirs::config_dir()
-            .unwrap()
-            .join("rpclip")
-            .join("config.yaml");
-        if default_config_file.exists() {
-            let content = std::fs::read_to_string(&default_config_file).unwrap_or_default();
-            cfg = serde_yaml::from_str(&content).ok();
-        }
-    }
-    let credentials = load_client_credentials(cfg.as_ref()).unwrap_or_else(|e| {
-        error!("Failed to load client authentication credentials: {e}");
-        std::process::exit(1);
-    });
-
-    match &args.command {
-        Commands::Get => {
+    match prepared.command {
+        PreparedCommand::Get => {
             let challenge =
                 match issue_challenge(&client, &credentials, ClipboardOperation::Get).await {
                     Ok(challenge) => challenge,
@@ -368,29 +391,7 @@ async fn main() {
             let text = rpclip::line_end::to_platform_line_ending(&text);
             print!("{}", text);
         }
-        Commands::Set => {
-            use std::io::Read;
-            let mut text = String::new();
-            if let Err(e) = std::io::stdin().lock().read_to_string(&mut text) {
-                error!("Failed to read stdin: {}", e);
-                std::process::exit(1);
-            }
-
-            let ciphertext = match encrypt_to_pubkey_line(
-                &credentials.server_public_key_line,
-                text.as_bytes(),
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("Failed to encrypt for server: {}", e);
-                    std::process::exit(1);
-                }
-            };
-
-            let blob = AgeEncryptedBlob {
-                ver: PROTOCOL_VERSION,
-                data: ciphertext,
-            };
+        PreparedCommand::Set(blob) => {
             let challenge =
                 match issue_challenge(&client, &credentials, ClipboardOperation::Set).await {
                     Ok(challenge) => challenge,
@@ -440,6 +441,35 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ssh_key::{Algorithm, LineEnding};
+    use std::io::Cursor;
+    use std::time::{Duration, Instant};
+
+    struct DelayedReader {
+        inner: Cursor<Vec<u8>>,
+        delay: Duration,
+        delayed: bool,
+    }
+
+    impl Read for DelayedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if !self.delayed {
+                std::thread::sleep(self.delay);
+                self.delayed = true;
+            }
+            self.inner.read(buffer)
+        }
+    }
+
+    fn write_test_key(dir: &std::path::Path, name: &str) -> (String, String) {
+        let private = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).unwrap();
+        let private_path = dir.join(name);
+        let public_path = dir.join(format!("{name}.pub"));
+        let public_line = private.public_key().to_openssh().unwrap();
+        std::fs::write(&private_path, private.to_openssh(LineEnding::LF).unwrap()).unwrap();
+        std::fs::write(&public_path, format!("{public_line}\n")).unwrap();
+        (private_path.to_string_lossy().into_owned(), public_line)
+    }
 
     #[tokio::test]
     async fn connection_attempt_times_out() {
@@ -475,5 +505,68 @@ mod tests {
             parse_listen_addr("./rpclip.sock".to_string()).unwrap(),
             ListenAddr::Unix("./rpclip.sock".into())
         );
+    }
+
+    #[test]
+    fn prepares_slow_set_input_before_connecting() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (client_private_path, client_public_line) =
+            write_test_key(dir.path(), "client_ed25519");
+        let (_, server_public_line) = write_test_key(dir.path(), "server_ed25519");
+        let client_public_path = format!("{client_private_path}.pub");
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "server_addr: \"{server_addr}\"\nssh_key_path: \"{client_private_path}\"\nssh_pubkey_path: \"{client_public_path}\"\nserver_ssh_pubkey: \"{server_public_line}\"\n"
+            ),
+        )
+        .unwrap();
+        let args = Args {
+            server: None,
+            config: Some(config_path.to_string_lossy().into_owned()),
+            command: Commands::Set,
+        };
+        let delay = Duration::from_millis(25);
+        let mut input = DelayedReader {
+            inner: Cursor::new(b"slow stdin".to_vec()),
+            delay,
+            delayed: false,
+        };
+
+        let started = Instant::now();
+        let prepared = prepare_client(args, &mut input).unwrap();
+        assert!(started.elapsed() >= delay);
+        assert!(matches!(prepared.command, PreparedCommand::Set(_)));
+        assert_eq!(
+            auth::parse_public_key(&client_public_line)
+                .unwrap()
+                .key_data(),
+            prepared.credentials.public_key.key_data()
+        );
+        assert!(matches!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn reports_preparation_errors_without_connecting() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let args = Args {
+            server: Some(listener.local_addr().unwrap().to_string()),
+            config: Some("missing-config.yaml".to_string()),
+            command: Commands::Get,
+        };
+
+        assert!(prepare_client(args, &mut std::io::empty()).is_err());
+        assert!(matches!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        ));
     }
 }
