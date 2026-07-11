@@ -15,9 +15,19 @@ bash <(curl -fsSL https://raw.githubusercontent.com/tttpob/rpclip/refs/heads/mas
 
 ## Running the Server
 ```pwsh
-rpclip-server --address '[::1]:6667'
+rpclip-server --address 127.0.0.1:6667 --address '[::1]:6667'
 ```
-Usually the server runs on your local Windows machine. The server uses `~/.ssh/id_ed25519` by default to decrypt incoming data; override with `--ssh-key-path <PATH>` if needed.
+Usually the server runs on your local Windows machine. The server uses `~/.ssh/id_ed25519` by default to decrypt incoming data and sign clipboard responses. Override it with `--ssh-key-path <PATH>`.
+
+The server authorizes client keys from the running user's `~/.ssh/authorized_keys` by default. Use a dedicated file when the SSH login list and clipboard access list should differ:
+
+```pwsh
+rpclip-server `
+  --address 127.0.0.1:6667 `
+  --authorized-keys-path ~/.config/rpclip/authorized_keys
+```
+
+The authorization file accepts multiple OpenSSH public keys and comments. RpClip rejects entries with OpenSSH options because it cannot enforce restrictions such as `from=`, `command=`, or `expiry-time=`. The server exits at startup when the file is missing, empty, malformed, contains options, or contains a key algorithm that age cannot use. RpClip currently accepts Ed25519 and RSA authorization keys.
 
 ## Setting Up SSH Remote Port Forwarding
 To communicate with the server from a remote client through SSH, set up remote port forwarding. On your SSH client machine, run:
@@ -57,15 +67,21 @@ cat something | rpclip-client set
 The `get` command fetches the current clipboard content from the server (local windows computer), and the `set` command updates the server's clipboard with the content piped into the client.
 
 ## Configuration
-The client supports configuration through a file. By default it loads `~/.config/rpclip/config.yaml` (or pass `--config <PATH>`). The configuration should specify the server address and, for encryption, SSH key details:
+The client supports configuration through a file. By default it loads `~/.config/rpclip/config.yaml` (or pass `--config <PATH>`). Both `get` and `set` use the client key to sign requests. Both commands also require the server public key so the client can verify clipboard responses and encrypt clipboard updates:
 ```yaml
 server_addr: "tcp://127.0.0.1:6667"    # or unix:///tmp/rpclip.sock on Linux
-# Optional: client key paths used for `get` (defaults shown)
+# Optional: client key paths (defaults shown)
 ssh_key_path: "~/.ssh/id_ed25519"
 ssh_pubkey_path: "~/.ssh/id_ed25519.pub"
-# Required for `set`: server's SSH public key (OpenSSH one-line format)
+# Required: server's SSH public key (OpenSSH one-line format)
 server_ssh_pubkey: "ssh-ed25519 AAAAC3... user@host"
 ```
 You can also pass `--server <ADDRESS>` to override `server_addr`. Use `tcp://HOST:PORT` or `unix://PATH` to select the transport explicitly. Existing numeric TCP addresses and path-like Unix socket addresses remain supported. If neither flag nor config is provided, the client uses `127.0.0.1:6667`.
 
 If you used the Linux installer script, wrapper commands are available: `rpc` (send/set) and `rpp` (receive/get).
+
+## Authentication
+
+For each operation, the server issues a random challenge that expires after 30 seconds. The client signs the protocol version, operation, challenge, client public key, and encrypted payload. The server checks the signature against its authorization file and consumes the challenge once. A captured request cannot authorize another operation or replay the same clipboard update.
+
+For `get`, the server encrypts the clipboard to the client key and signs the response with its private key. The client verifies that signature against `server_ssh_pubkey` before it decrypts or prints the clipboard. Protocol version 3 changes the RPC schema, so version 3 clients require a version 3 server.
