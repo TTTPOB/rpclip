@@ -7,7 +7,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::{
     AgeEncryptedBlob, AuthRequest, Challenge, ChallengeRequest, ClipboardOperation, SetRequest,
@@ -15,12 +15,9 @@ use crate::{
 };
 
 pub const SIGNATURE_NAMESPACE: &str = "rpclip-auth";
-pub const CHALLENGE_SIGNATURE_NAMESPACE: &str = "rpclip-challenge";
+pub const CHALLENGE_SIGNATURE_NAMESPACE: &str = "rpclip-challenge-cookie";
 pub const CHALLENGE_TTL: Duration = Duration::from_secs(30);
-const MAX_OUTSTANDING_CHALLENGES: usize = 1024;
-const MAX_CHALLENGES_PER_CLIENT_OPERATION: usize = 4;
-const MAX_PREAUTH_NONCES_PER_CLIENT: usize = 64;
-const PREAUTH_MAX_AGE: Duration = Duration::from_secs(30);
+const MAX_USED_CHALLENGES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Serialize)]
 enum SignedOperation {
@@ -35,9 +32,10 @@ struct ChallengeSigningEnvelope<'a> {
     format: &'static [u8],
     protocol_version: u8,
     operation: ClipboardOperation,
-    client_ssh_pubkey: &'a str,
-    client_nonce: &'a [u8; 32],
+    client_fingerprint: &'a str,
+    nonce: &'a [u8; 32],
     issued_at_unix_seconds: u64,
+    expires_at_unix_seconds: u64,
 }
 
 #[derive(Serialize)]
@@ -71,14 +69,15 @@ fn signing_bytes(
         .map_err(|e| format!("failed to encode signature input: {e}"))
 }
 
-fn challenge_signing_bytes(request: &ChallengeRequest) -> Result<Vec<u8>, String> {
+fn challenge_signing_bytes(challenge: &Challenge) -> Result<Vec<u8>, String> {
     let envelope = ChallengeSigningEnvelope {
-        format: b"rpclip-challenge-signature-v1",
+        format: b"rpclip-challenge-cookie-v1",
         protocol_version: PROTOCOL_VERSION,
-        operation: request.operation,
-        client_ssh_pubkey: &request.client_ssh_pubkey,
-        client_nonce: &request.client_nonce,
-        issued_at_unix_seconds: request.issued_at_unix_seconds,
+        operation: challenge.operation,
+        client_fingerprint: &challenge.client_fingerprint,
+        nonce: &challenge.nonce,
+        issued_at_unix_seconds: challenge.issued_at_unix_seconds,
+        expires_at_unix_seconds: challenge.expires_at_unix_seconds,
     };
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
@@ -89,6 +88,7 @@ fn challenge_signing_bytes(request: &ChallengeRequest) -> Result<Vec<u8>, String
 pub fn parse_public_key(line: &str) -> Result<PublicKey, String> {
     let public_key =
         PublicKey::from_openssh(line).map_err(|e| format!("invalid SSH public key: {e}"))?;
+    ensure_ed25519(public_key.algorithm())?;
     validate_age_recipient(line)?;
     Ok(public_key)
 }
@@ -108,27 +108,54 @@ pub fn read_private_key(path: &Path) -> Result<PrivateKey, String> {
             path.display()
         ));
     }
-    ensure_age_compatible(private_key.algorithm())?;
+    ensure_ed25519(private_key.algorithm())?;
     Ok(private_key)
 }
 
 pub fn read_server_private_key(path: &Path) -> Result<PrivateKey, String> {
-    let private_key = read_private_key(path)?;
+    read_server_key_snapshot(path).map(|snapshot| snapshot.private_key)
+}
+
+pub struct ServerKeySnapshot {
+    pub private_key: PrivateKey,
+    pub encoded: Arc<Vec<u8>>,
+}
+
+pub fn read_server_key_snapshot(path: &Path) -> Result<ServerKeySnapshot, String> {
+    let encoded = std::fs::read(path)
+        .map_err(|e| format!("failed to read SSH private key {}: {e}", path.display()))?;
+    let private_key = PrivateKey::from_openssh(&encoded)
+        .map_err(|e| format!("failed to parse SSH private key {}: {e}", path.display()))?;
+    if private_key.is_encrypted() {
+        return Err(format!(
+            "SSH private key {} is encrypted; passphrase-protected keys are not supported",
+            path.display()
+        ));
+    }
     if private_key.algorithm() != Algorithm::Ed25519 {
         return Err(format!(
             "server SSH private key {} must use Ed25519",
             path.display()
         ));
     }
-    Ok(private_key)
+    age::ssh::Identity::from_buffer(
+        std::io::Cursor::new(&encoded),
+        Some(path.display().to_string()),
+    )
+    .map_err(|e| format!("failed to parse server key as an age identity: {e:?}"))?;
+    Ok(ServerKeySnapshot {
+        private_key,
+        encoded: Arc::new(encoded),
+    })
 }
 
-fn ensure_age_compatible(algorithm: Algorithm) -> Result<(), String> {
-    match algorithm {
-        Algorithm::Ed25519 | Algorithm::Rsa { .. } => Ok(()),
-        algorithm => Err(format!(
-            "SSH key algorithm {algorithm} cannot be used for age encryption"
-        )),
+fn ensure_ed25519(algorithm: Algorithm) -> Result<(), String> {
+    if algorithm == Algorithm::Ed25519 {
+        Ok(())
+    } else {
+        Err(format!(
+            "SSH key algorithm {algorithm} is unsupported; rpclip requires Ed25519"
+        ))
     }
 }
 
@@ -153,46 +180,37 @@ fn verify(
         .map_err(|e| format!("SSH signature verification failed: {e}"))
 }
 
-pub fn sign_challenge_request(
-    private_key: &PrivateKey,
+pub fn make_challenge_request(
     client_ssh_pubkey: String,
     operation: ClipboardOperation,
-) -> Result<ChallengeRequest, String> {
-    let mut request = ChallengeRequest {
+) -> ChallengeRequest {
+    ChallengeRequest {
         ver: PROTOCOL_VERSION,
         operation,
         client_ssh_pubkey,
-        client_nonce: [0; 32],
-        issued_at_unix_seconds: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "system clock is before the Unix epoch".to_string())?
-            .as_secs(),
-        signature: String::new(),
-    };
-    OsRng.fill_bytes(&mut request.client_nonce);
-    let message = challenge_signing_bytes(&request)?;
-    request.signature = sign(private_key, CHALLENGE_SIGNATURE_NAMESPACE, &message)?;
-    Ok(request)
+    }
 }
 
-pub fn verify_challenge_request(
-    public_key: &PublicKey,
-    request: &ChallengeRequest,
+pub fn verify_server_challenge(
+    server_public_key: &PublicKey,
+    challenge: &Challenge,
+    client_public_key: &PublicKey,
+    operation: ClipboardOperation,
 ) -> Result<(), String> {
-    request.validate_version()?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| "system clock is before the Unix epoch".to_string())?
-        .as_secs();
-    if now.abs_diff(request.issued_at_unix_seconds) > PREAUTH_MAX_AGE.as_secs() {
-        return Err("challenge request timestamp is outside the allowed window".to_string());
+    challenge.validate_version()?;
+    if challenge.operation != operation {
+        return Err("server challenge belongs to another operation".to_string());
     }
-    let message = challenge_signing_bytes(request)?;
+    let fingerprint = client_public_key.fingerprint(HashAlg::Sha256).to_string();
+    if challenge.client_fingerprint != fingerprint {
+        return Err("server challenge belongs to another client key".to_string());
+    }
+    let message = challenge_signing_bytes(challenge)?;
     verify(
-        public_key,
+        server_public_key,
         CHALLENGE_SIGNATURE_NAMESPACE,
         &message,
-        &request.signature,
+        &challenge.signature,
     )
 }
 
@@ -367,6 +385,7 @@ impl AuthorizedClients {
                     entry.config_opts()
                 ));
             }
+            ensure_ed25519(entry.public_key().algorithm())?;
             validate_age_recipient(
                 &entry
                     .public_key()
@@ -392,139 +411,42 @@ impl AuthorizedClients {
     }
 }
 
-struct ChallengeRecord {
-    client_fingerprint: String,
-    operation: ClipboardOperation,
-    issued_at: Instant,
-    expires_at: Instant,
-}
-
 pub struct ChallengeStore {
-    entries: Mutex<HashMap<[u8; 32], ChallengeRecord>>,
-    used_client_nonces: Mutex<HashMap<(String, [u8; 32]), Instant>>,
-    ttl: Duration,
+    used_nonces: Mutex<HashMap<[u8; 32], u64>>,
 }
 
 impl ChallengeStore {
-    pub fn new(ttl: Duration) -> Self {
+    pub fn new() -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
-            used_client_nonces: Mutex::new(HashMap::new()),
-            ttl,
+            used_nonces: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn issue(
-        &self,
-        client_public_key: &PublicKey,
-        operation: ClipboardOperation,
-        client_nonce: [u8; 32],
-    ) -> Result<Challenge, String> {
-        let now = Instant::now();
-        let fingerprint = client_public_key.fingerprint(HashAlg::Sha256).to_string();
-        let mut used_client_nonces = self
-            .used_client_nonces
+    pub fn consume(&self, challenge: &Challenge, now_unix_seconds: u64) -> Result<(), String> {
+        let mut used_nonces = self
+            .used_nonces
             .lock()
-            .map_err(|_| "pre-authentication nonce store lock is poisoned".to_string())?;
-        used_client_nonces.retain(|_, expires_at| *expires_at > now);
-        if used_client_nonces.contains_key(&(fingerprint.clone(), client_nonce)) {
-            return Err("challenge request nonce has already been used".to_string());
+            .map_err(|_| "used challenge cache lock is poisoned".to_string())?;
+        used_nonces.retain(|_, expires_at| *expires_at >= now_unix_seconds);
+        if used_nonces.contains_key(&challenge.nonce) {
+            return Err("authentication challenge has already been used".to_string());
         }
-        let client_nonce_count = used_client_nonces
-            .keys()
-            .filter(|(client, _)| client == &fingerprint)
-            .count();
-        if client_nonce_count >= MAX_PREAUTH_NONCES_PER_CLIENT {
-            return Err("too many recent challenge requests for this client key".to_string());
+        if used_nonces.len() >= MAX_USED_CHALLENGES {
+            return Err("used challenge cache is full".to_string());
         }
-        used_client_nonces.insert((fingerprint.clone(), client_nonce), now + PREAUTH_MAX_AGE);
-        drop(used_client_nonces);
-
-        let mut entries = self
-            .entries
-            .lock()
-            .map_err(|_| "challenge store lock is poisoned".to_string())?;
-        entries.retain(|_, record| record.expires_at > now);
-        let mut matching: Vec<_> = entries
-            .iter()
-            .filter(|(_, record)| {
-                record.client_fingerprint == fingerprint && record.operation == operation
-            })
-            .map(|(nonce, record)| (*nonce, record.issued_at))
-            .collect();
-        matching.sort_by_key(|(_, issued_at)| *issued_at);
-        let remove_count = matching
-            .len()
-            .saturating_sub(MAX_CHALLENGES_PER_CLIENT_OPERATION - 1);
-        for (nonce, _) in matching.into_iter().take(remove_count) {
-            entries.remove(&nonce);
-        }
-        if entries.len() >= MAX_OUTSTANDING_CHALLENGES {
-            if let Some(oldest) = entries
-                .iter()
-                .min_by_key(|(_, record)| record.issued_at)
-                .map(|(nonce, _)| *nonce)
-            {
-                entries.remove(&oldest);
-            }
-        }
-
-        let nonce = loop {
-            let mut nonce = [0_u8; 32];
-            OsRng.fill_bytes(&mut nonce);
-            if !entries.contains_key(&nonce) {
-                break nonce;
-            }
-        };
-        entries.insert(
-            nonce,
-            ChallengeRecord {
-                client_fingerprint: fingerprint,
-                operation,
-                issued_at: now,
-                expires_at: now + self.ttl,
-            },
-        );
-        Ok(Challenge {
-            ver: PROTOCOL_VERSION,
-            nonce,
-        })
-    }
-
-    pub fn consume(
-        &self,
-        challenge: &Challenge,
-        client_public_key: &PublicKey,
-        operation: ClipboardOperation,
-    ) -> Result<(), String> {
-        challenge.validate_version()?;
-        let now = Instant::now();
-        let mut entries = self
-            .entries
-            .lock()
-            .map_err(|_| "challenge store lock is poisoned".to_string())?;
-        let Some(record) = entries.get(&challenge.nonce) else {
-            return Err("authentication challenge is unknown or already used".to_string());
-        };
-        if record.expires_at <= now {
-            entries.remove(&challenge.nonce);
-            return Err("authentication challenge has expired".to_string());
-        }
-        let fingerprint = client_public_key.fingerprint(HashAlg::Sha256).to_string();
-        if record.client_fingerprint != fingerprint {
-            return Err("authentication challenge belongs to another client key".to_string());
-        }
-        if record.operation != operation {
-            return Err("authentication challenge belongs to another operation".to_string());
-        }
-        entries.remove(&challenge.nonce);
+        used_nonces.insert(challenge.nonce, challenge.expires_at_unix_seconds);
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.used_nonces.lock().unwrap().len()
     }
 }
 
 impl Default for ChallengeStore {
     fn default() -> Self {
-        Self::new(CHALLENGE_TTL)
+        Self::new()
     }
 }
 
@@ -552,29 +474,44 @@ impl ServerAuthenticator {
     }
 
     pub fn issue_challenge(&self, request: &ChallengeRequest) -> Result<Challenge, String> {
+        request.validate_version()?;
         let public_key = parse_public_key(&request.client_ssh_pubkey)?;
         self.authorized_clients.authorize(&public_key)?;
-        verify_challenge_request(&public_key, request)?;
-        self.challenges
-            .issue(&public_key, request.operation, request.client_nonce)
+        let now = unix_time_seconds()?;
+        let mut challenge = Challenge {
+            ver: PROTOCOL_VERSION,
+            operation: request.operation,
+            client_fingerprint: public_key.fingerprint(HashAlg::Sha256).to_string(),
+            nonce: [0; 32],
+            issued_at_unix_seconds: now,
+            expires_at_unix_seconds: now + CHALLENGE_TTL.as_secs(),
+            signature: String::new(),
+        };
+        OsRng.fill_bytes(&mut challenge.nonce);
+        let message = challenge_signing_bytes(&challenge)?;
+        challenge.signature = sign(&self.private_key, CHALLENGE_SIGNATURE_NAMESPACE, &message)?;
+        Ok(challenge)
     }
 
     pub fn authenticate_get(&self, request: &AuthRequest) -> Result<PublicKey, String> {
         let public_key = self.authorize(&request.client_ssh_pubkey)?;
+        self.verify_challenge(&request.challenge, &public_key, ClipboardOperation::Get)?;
         verify_get_request(&public_key, request)?;
         self.challenges
-            .consume(&request.challenge, &public_key, ClipboardOperation::Get)?;
+            .consume(&request.challenge, unix_time_seconds()?)?;
         Ok(public_key)
     }
 
     pub fn authenticate_set(&self, request: &SetRequest) -> Result<PublicKey, String> {
         let public_key = self.authorize(&request.auth.client_ssh_pubkey)?;
-        verify_set_request(&public_key, &request.auth, &request.blob)?;
-        self.challenges.consume(
+        self.verify_challenge(
             &request.auth.challenge,
             &public_key,
             ClipboardOperation::Set,
         )?;
+        verify_set_request(&public_key, &request.auth, &request.blob)?;
+        self.challenges
+            .consume(&request.auth.challenge, unix_time_seconds()?)?;
         Ok(public_key)
     }
 
@@ -595,6 +532,40 @@ impl ServerAuthenticator {
         self.authorized_clients.authorize(&public_key)?;
         Ok(public_key)
     }
+
+    fn verify_challenge(
+        &self,
+        challenge: &Challenge,
+        client_public_key: &PublicKey,
+        operation: ClipboardOperation,
+    ) -> Result<(), String> {
+        verify_server_challenge(
+            self.private_key.public_key(),
+            challenge,
+            client_public_key,
+            operation,
+        )?;
+        let now = unix_time_seconds()?;
+        if challenge.issued_at_unix_seconds > now {
+            return Err("authentication challenge was issued in the future".to_string());
+        }
+        if challenge.expires_at_unix_seconds < now {
+            return Err("authentication challenge has expired".to_string());
+        }
+        if challenge.expires_at_unix_seconds
+            != challenge.issued_at_unix_seconds + CHALLENGE_TTL.as_secs()
+        {
+            return Err("authentication challenge has an invalid lifetime".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn unix_time_seconds() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| "system clock is before the Unix epoch".to_string())
 }
 
 #[cfg(test)]
@@ -609,7 +580,12 @@ mod tests {
     fn challenge(byte: u8) -> Challenge {
         Challenge {
             ver: PROTOCOL_VERSION,
+            operation: ClipboardOperation::Get,
+            client_fingerprint: "test-client".to_string(),
             nonce: [byte; 32],
+            issued_at_unix_seconds: 1,
+            expires_at_unix_seconds: 2,
+            signature: "test-cookie-signature".to_string(),
         }
     }
 
@@ -699,16 +675,25 @@ mod tests {
         let public_key_line = ecdsa.public_key().to_openssh().expect("public key");
 
         let error = parse_public_key(&public_key_line).expect_err("ECDSA should be rejected");
-        assert!(error.contains("cannot be used as an age recipient"));
+        assert!(error.contains("requires Ed25519"));
     }
 
     #[test]
-    fn rejects_weak_rsa_key_accepted_by_openssh_parser() {
+    fn rejects_rsa_client_key_accepted_by_openssh_parser() {
         let line = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQDeUHcr1y8DvAKSO3A3B1sznHOq62fn4rMHoT0IlBG+QN+ve4sjMm5HpI1t4nptWg3o8ncQxqKyYa0VJzfmqu/JBXJbQnqoqsEMCEBJhsKEKlKreqjcd1SLFfb+fNIr3+pgdqorwWG6dW7NOn3tkzoOPqRp9tZ8u3TDuhvst6Wv2w==";
         assert!(PublicKey::from_openssh(line).is_ok());
 
-        let error = parse_public_key(line).expect_err("weak RSA key should be rejected");
-        assert!(error.contains("cannot be used as an age recipient"));
+        let error = parse_public_key(line).expect_err("RSA client key should be rejected");
+        assert!(error.contains("requires Ed25519"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("authorized_keys");
+        std::fs::write(&path, format!("{line} rsa-client\n")).unwrap();
+        let error = match AuthorizedClients::read_file(&path) {
+            Ok(_) => panic!("RSA authorization key should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("requires Ed25519"));
     }
 
     #[test]
@@ -739,20 +724,54 @@ mod tests {
     }
 
     #[test]
-    fn challenge_request_proves_key_possession_and_binds_operation() {
+    fn server_challenge_is_signed_and_binds_operation_and_client() {
         let client = keypair();
+        let server = keypair();
         let other = keypair();
-        let mut request = sign_challenge_request(
-            &client,
+        let authenticator = authenticator(&client, &server);
+        let request = make_challenge_request(
             client.public_key().to_openssh().expect("public key"),
             ClipboardOperation::Get,
+        );
+        let mut challenge = authenticator
+            .issue_challenge(&request)
+            .expect("issue challenge");
+        for _ in 0..100 {
+            authenticator
+                .issue_challenge(&request)
+                .expect("issue stateless challenge");
+        }
+        assert_eq!(authenticator.challenges.len(), 0);
+        assert!(verify_server_challenge(
+            server.public_key(),
+            &challenge,
+            client.public_key(),
+            ClipboardOperation::Get,
         )
-        .expect("sign challenge request");
-        assert!(verify_challenge_request(client.public_key(), &request).is_ok());
-        assert!(verify_challenge_request(other.public_key(), &request).is_err());
+        .is_ok());
+        assert!(verify_server_challenge(
+            server.public_key(),
+            &challenge,
+            other.public_key(),
+            ClipboardOperation::Get,
+        )
+        .is_err());
+        assert!(verify_server_challenge(
+            server.public_key(),
+            &challenge,
+            client.public_key(),
+            ClipboardOperation::Set,
+        )
+        .is_err());
 
-        request.operation = ClipboardOperation::Set;
-        assert!(verify_challenge_request(client.public_key(), &request).is_err());
+        challenge.nonce[0] ^= 1;
+        assert!(verify_server_challenge(
+            server.public_key(),
+            &challenge,
+            client.public_key(),
+            ClipboardOperation::Get,
+        )
+        .is_err());
     }
 
     #[test]
@@ -760,21 +779,14 @@ mod tests {
         let client = keypair();
         let server = keypair();
         let authenticator = Arc::new(authenticator(&client, &server));
-        let challenge_request = sign_challenge_request(
-            &client,
+        let challenge_request = make_challenge_request(
             client.public_key().to_openssh().expect("public key"),
             ClipboardOperation::Get,
-        )
-        .expect("sign challenge request");
+        );
         let challenge = authenticator
             .issue_challenge(&challenge_request)
             .expect("issue challenge");
-        assert_eq!(
-            authenticator
-                .issue_challenge(&challenge_request)
-                .expect_err("pre-authentication replay should fail"),
-            "challenge request nonce has already been used"
-        );
+        assert_eq!(authenticator.challenges.len(), 0);
         let request = sign_get_request(&client, challenge_request.client_ssh_pubkey, challenge)
             .expect("sign get request");
 
@@ -791,30 +803,21 @@ mod tests {
             .filter(Result::is_ok)
             .count();
         assert_eq!(success_count, 1);
+        assert_eq!(authenticator.challenges.len(), 1);
     }
 
     #[test]
-    fn production_authenticator_rejects_unauthorized_and_invalid_preauthentication() {
+    fn production_authenticator_rejects_unauthorized_challenge_requests() {
         let client = keypair();
         let server = keypair();
         let other = keypair();
         let authenticator = authenticator(&client, &server);
 
-        let unauthorized = sign_challenge_request(
-            &other,
+        let unauthorized = make_challenge_request(
             other.public_key().to_openssh().expect("public key"),
             ClipboardOperation::Get,
-        )
-        .expect("sign unauthorized request");
+        );
         assert!(authenticator.issue_challenge(&unauthorized).is_err());
-
-        let invalid = sign_challenge_request(
-            &other,
-            client.public_key().to_openssh().expect("public key"),
-            ClipboardOperation::Get,
-        )
-        .expect("sign invalid request");
-        assert!(authenticator.issue_challenge(&invalid).is_err());
     }
 
     #[test]
@@ -833,56 +836,47 @@ mod tests {
     }
 
     #[test]
-    fn consumes_challenges_once_and_rejects_expired_challenges() {
-        let client = keypair();
-        let store = ChallengeStore::new(Duration::from_secs(30));
-        let issued = store
-            .issue(client.public_key(), ClipboardOperation::Get, [1; 32])
-            .expect("issue challenge");
-        assert!(store
-            .consume(&issued, client.public_key(), ClipboardOperation::Get)
-            .is_ok());
+    fn consumes_challenges_once() {
+        let store = ChallengeStore::new();
+        let issued = Challenge {
+            expires_at_unix_seconds: 20,
+            ..challenge(1)
+        };
+        assert!(store.consume(&issued, 10).is_ok());
         assert_eq!(
-            store.consume(&issued, client.public_key(), ClipboardOperation::Get),
-            Err("authentication challenge is unknown or already used".to_string())
-        );
-
-        let expiring_store = ChallengeStore::new(Duration::ZERO);
-        let expired = expiring_store
-            .issue(client.public_key(), ClipboardOperation::Get, [2; 32])
-            .expect("issue expiring challenge");
-        assert_eq!(
-            expiring_store.consume(&expired, client.public_key(), ClipboardOperation::Get),
-            Err("authentication challenge has expired".to_string())
+            store.consume(&issued, 10),
+            Err("authentication challenge has already been used".to_string())
         );
     }
 
     #[test]
-    fn limits_outstanding_challenges_per_client_operation() {
+    fn production_authenticator_rejects_expired_challenge() {
         let client = keypair();
-        let store = ChallengeStore::default();
-        let challenges: Vec<_> = (0..=MAX_CHALLENGES_PER_CLIENT_OPERATION)
-            .map(|index| {
-                store
-                    .issue(
-                        client.public_key(),
-                        ClipboardOperation::Set,
-                        [index as u8; 32],
-                    )
-                    .expect("issue challenge")
-            })
-            .collect();
+        let server = keypair();
+        let authenticator = authenticator(&client, &server);
+        let now = unix_time_seconds().unwrap();
+        let mut expired = Challenge {
+            ver: PROTOCOL_VERSION,
+            operation: ClipboardOperation::Get,
+            client_fingerprint: client.public_key().fingerprint(HashAlg::Sha256).to_string(),
+            nonce: [9; 32],
+            issued_at_unix_seconds: now - CHALLENGE_TTL.as_secs() - 1,
+            expires_at_unix_seconds: now - 1,
+            signature: String::new(),
+        };
+        expired.signature = sign(
+            &server,
+            CHALLENGE_SIGNATURE_NAMESPACE,
+            &challenge_signing_bytes(&expired).unwrap(),
+        )
+        .unwrap();
+        let request =
+            sign_get_request(&client, client.public_key().to_openssh().unwrap(), expired).unwrap();
 
-        assert!(store
-            .consume(&challenges[0], client.public_key(), ClipboardOperation::Set,)
-            .is_err());
-        assert!(store
-            .consume(
-                challenges.last().unwrap(),
-                client.public_key(),
-                ClipboardOperation::Set,
-            )
-            .is_ok());
+        assert_eq!(
+            authenticator.authenticate_get(&request).unwrap_err(),
+            "authentication challenge has expired"
+        );
     }
 
     #[test]
@@ -954,6 +948,8 @@ mod tests {
         std::fs::write(&path, rsa.to_openssh(LineEnding::LF).expect("private key"))
             .expect("write private key");
 
+        let error = read_private_key(&path).expect_err("RSA client key should be rejected");
+        assert!(error.contains("requires Ed25519"));
         let error = read_server_private_key(&path).expect_err("RSA server key should be rejected");
         assert!(error.contains("must use Ed25519"));
 

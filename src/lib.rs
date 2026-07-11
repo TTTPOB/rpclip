@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod auth;
 
-pub const PROTOCOL_VERSION: u8 = 4;
+pub const PROTOCOL_VERSION: u8 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ClipboardOperation {
@@ -15,9 +15,6 @@ pub struct ChallengeRequest {
     pub ver: u8,
     pub operation: ClipboardOperation,
     pub client_ssh_pubkey: String,
-    pub client_nonce: [u8; 32],
-    pub issued_at_unix_seconds: u64,
-    pub signature: String,
 }
 
 impl ChallengeRequest {
@@ -29,7 +26,12 @@ impl ChallengeRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Challenge {
     pub ver: u8,
+    pub operation: ClipboardOperation,
+    pub client_fingerprint: String,
     pub nonce: [u8; 32],
+    pub issued_at_unix_seconds: u64,
+    pub expires_at_unix_seconds: u64,
+    pub signature: String,
 }
 
 impl Challenge {

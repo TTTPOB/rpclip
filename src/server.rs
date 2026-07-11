@@ -4,7 +4,7 @@ use arboard::Clipboard;
 use clap::Parser;
 use futures::prelude::*;
 use log::{error, info};
-use rpclip::auth::{self, AuthorizedClients, ChallengeStore, ServerAuthenticator, CHALLENGE_TTL};
+use rpclip::auth::{self, AuthorizedClients, ChallengeStore, ServerAuthenticator};
 use rpclip::{
     AgeEncryptedBlob, AuthRequest, Challenge, ChallengeRequest, RpClip, SetRequest,
     SignedClipboard, SignedSetResponse, PROTOCOL_VERSION,
@@ -17,15 +17,13 @@ use std::{
 };
 use tarpc::{
     context,
-    server::{
-        self,
-        incoming::{spawn_incoming, Incoming},
-    },
+    server::{self, incoming::Incoming},
     tokio_serde::formats::Bincode,
 };
 
 const MAX_OPEN_CHANNELS: u32 = 64;
 const MAX_CONCURRENT_REQUESTS_PER_CHANNEL: usize = 8;
+const CHANNEL_LIFETIME: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Parser)]
 struct Args {
@@ -42,7 +40,7 @@ struct Args {
 #[derive(Clone)]
 struct RpClipServer {
     clipboard: Arc<Mutex<Clipboard>>,
-    ssh_key_path: String,
+    ssh_key_bytes: Arc<Vec<u8>>,
     authenticator: Arc<ServerAuthenticator>,
 }
 
@@ -81,10 +79,10 @@ impl RpClip for RpClipServer {
         let response = self.authenticator.sign_set_response(&request)?;
 
         let clipboard = self.clipboard.clone();
-        let ssh_key_path = self.ssh_key_path.clone();
+        let ssh_key_bytes = self.ssh_key_bytes.clone();
         let blob = request.blob;
         tokio::task::spawn_blocking(move || {
-            decrypt_and_set_clipboard(clipboard, ssh_key_path, blob)
+            decrypt_and_set_clipboard(clipboard, ssh_key_bytes, blob)
         })
         .await
         .map_err(|e| format!("clipboard worker failed: {e}"))??;
@@ -153,25 +151,30 @@ fn encrypt_clipboard(
 
 fn decrypt_and_set_clipboard(
     clipboard: Arc<Mutex<Clipboard>>,
-    ssh_key_path: String,
+    ssh_key_bytes: Arc<Vec<u8>>,
     blob: AgeEncryptedBlob,
 ) -> Result<(), String> {
-    let key_path = expand_tilde(&ssh_key_path);
-    let key_bytes = match std::fs::read(&key_path) {
-        Ok(b) => b,
-        Err(e) => {
-            error!("failed to read ssh key {}: {}", key_path, e);
-            return Err(format!("failed to read server SSH key: {e}"));
-        }
-    };
-    let identity =
-        match ssh::Identity::from_buffer(std::io::Cursor::new(key_bytes), Some(key_path.clone())) {
-            Ok(i) => i,
-            Err(e) => {
-                error!("failed to parse ssh identity {}: {:?}", key_path, e);
-                return Err(format!("failed to parse server SSH identity: {e:?}"));
-            }
-        };
+    let text = decrypt_blob(&ssh_key_bytes, &blob)?;
+
+    if let Err(e) = clipboard
+        .lock()
+        .map_err(|_| "clipboard lock is poisoned".to_string())?
+        .set_text(rpclip::line_end::to_platform_line_ending(&text))
+    {
+        error!("server failed to set clipboard text: {e}");
+        Err(format!("failed to set system clipboard: {e}"))
+    } else {
+        info!("server set clipboard text (len={} bytes)", text.len());
+        Ok(())
+    }
+}
+
+fn decrypt_blob(ssh_key_bytes: &[u8], blob: &AgeEncryptedBlob) -> Result<String, String> {
+    let identity = ssh::Identity::from_buffer(
+        std::io::Cursor::new(ssh_key_bytes),
+        Some("cached server SSH key".to_string()),
+    )
+    .map_err(|e| format!("failed to parse cached server SSH identity: {e:?}"))?;
     let decryptor = match Decryptor::new(&blob.data[..]) {
         Ok(d) => d,
         Err(e) => {
@@ -193,24 +196,12 @@ fn decrypt_and_set_clipboard(
         return Err(format!("failed to decrypt clipboard data: {e}"));
     }
 
-    let text = match String::from_utf8(plaintext) {
-        Ok(s) => s,
+    match String::from_utf8(plaintext) {
+        Ok(s) => Ok(s),
         Err(e) => {
             error!("utf8 error: {}", e);
-            return Err(format!("clipboard data is not valid UTF-8: {e}"));
+            Err(format!("clipboard data is not valid UTF-8: {e}"))
         }
-    };
-
-    if let Err(e) = clipboard
-        .lock()
-        .map_err(|_| "clipboard lock is poisoned".to_string())?
-        .set_text(rpclip::line_end::to_platform_line_ending(&text))
-    {
-        error!("server failed to set clipboard text: {e}");
-        Err(format!("failed to set system clipboard: {e}"))
-    } else {
-        info!("server set clipboard text (len={} bytes)", text.len());
-        Ok(())
     }
 }
 
@@ -245,15 +236,14 @@ fn default_authorized_keys_path() -> Result<PathBuf, String> {
         "cannot determine home directory; pass --authorized-keys-path".to_string()
     })?;
     #[cfg(windows)]
-    {
-        return authorized_keys_path_for(
-            &home,
-            current_user_is_windows_administrator()?,
-            std::env::var_os("ProgramData").as_deref(),
-        );
-    }
+    let path = authorized_keys_path_for(
+        &home,
+        current_user_is_windows_administrator()?,
+        std::env::var_os("ProgramData").as_deref(),
+    );
     #[cfg(not(windows))]
-    authorized_keys_path_for(&home, false, None)
+    let path = authorized_keys_path_for(&home, false, None);
+    path
 }
 
 #[cfg(windows)]
@@ -356,25 +346,66 @@ fn current_user_is_windows_administrator() -> Result<bool, String> {
 fn load_server_security(
     ssh_key_path: Option<String>,
     authorized_keys_path: Option<String>,
-) -> Result<(String, Arc<ServerAuthenticator>), String> {
+) -> Result<(Arc<Vec<u8>>, Arc<ServerAuthenticator>), String> {
     let ssh_key_path =
         expand_tilde(&ssh_key_path.unwrap_or_else(|| "~/.ssh/id_ed25519".to_string()));
     let authorized_keys_path = match authorized_keys_path {
         Some(path) => PathBuf::from(expand_tilde(&path)),
         None => default_authorized_keys_path()?,
     };
-    let private_key = auth::read_server_private_key(PathBuf::from(&ssh_key_path).as_path())?;
+    let key_snapshot = auth::read_server_key_snapshot(PathBuf::from(&ssh_key_path).as_path())?;
     let authorized_clients = AuthorizedClients::read_file(&authorized_keys_path)?;
     info!(
         "Loaded client authorization keys from {}",
         authorized_keys_path.display()
     );
     let authenticator = ServerAuthenticator::new(
-        Arc::new(private_key),
+        Arc::new(key_snapshot.private_key),
         Arc::new(authorized_clients),
-        Arc::new(ChallengeStore::new(CHALLENGE_TTL)),
+        Arc::new(ChallengeStore::new()),
     )?;
-    Ok((ssh_key_path, Arc::new(authenticator)))
+    Ok((key_snapshot.encoded, Arc::new(authenticator)))
+}
+
+async fn drive_channel_for_lifetime<C, R>(channel: C, lifetime: std::time::Duration) -> bool
+where
+    C: Stream<Item = R>,
+    R: std::future::Future<Output = ()> + Send + 'static,
+{
+    let drive = async move {
+        futures::pin_mut!(channel);
+        let mut requests = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                request = channel.next() => match request {
+                    Some(request) => {
+                        requests.spawn(request);
+                    }
+                    None => break,
+                },
+                Some(_) = requests.join_next(), if !requests.is_empty() => {}
+            }
+        }
+    };
+    tokio::time::timeout(lifetime, drive).await.is_err()
+}
+
+async fn spawn_incoming_with_lifetime(
+    incoming: impl Stream<
+        Item = impl Stream<Item = impl std::future::Future<Output = ()> + Send + 'static>
+                   + Send
+                   + 'static,
+    >,
+    lifetime: std::time::Duration,
+) {
+    futures::pin_mut!(incoming);
+    while let Some(channel) = incoming.next().await {
+        tokio::spawn(async move {
+            if drive_channel_for_lifetime(channel, lifetime).await {
+                info!("Closed RPC channel after reaching its lifetime limit");
+            }
+        });
+    }
 }
 
 #[tokio::main]
@@ -382,7 +413,7 @@ async fn main() {
     env_logger::init();
     // Parse command line arguments
     let args = Args::parse();
-    let (ssh_key_path, authenticator) =
+    let (ssh_key_bytes, authenticator) =
         load_server_security(args.ssh_key_path, args.authorized_keys_path).unwrap_or_else(|e| {
             error!("Unable to initialize server authentication: {e}");
             std::process::exit(1);
@@ -405,7 +436,7 @@ async fn main() {
     info!("Clipboard server started");
     let rpserver = RpClipServer {
         clipboard,
-        ssh_key_path,
+        ssh_key_bytes,
         authenticator,
     };
     let incoming = futures::stream::select_all(listeners)
@@ -422,7 +453,7 @@ async fn main() {
         .max_channels_per_key(MAX_OPEN_CHANNELS, |_| "global")
         .max_concurrent_requests_per_channel(MAX_CONCURRENT_REQUESTS_PER_CHANNEL)
         .execute(rpserver.serve());
-    spawn_incoming(incoming).await;
+    spawn_incoming_with_lifetime(incoming, CHANNEL_LIFETIME).await;
     error!("All server listeners stopped");
     std::process::exit(1);
 }
@@ -430,6 +461,8 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ssh_key::{Algorithm, LineEnding, PrivateKey};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn accepts_multiple_listen_addresses() {
@@ -472,5 +505,63 @@ mod tests {
                 .join("administrators_authorized_keys")
         );
         assert!(authorized_keys_path_for(home, true, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn closes_idle_channels_after_lifetime() {
+        let idle = futures::stream::pending::<std::future::Ready<()>>();
+        assert!(drive_channel_for_lifetime(idle, std::time::Duration::from_millis(1)).await);
+    }
+
+    #[tokio::test]
+    async fn cancels_in_flight_requests_at_channel_lifetime() {
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let request_dropped = dropped.clone();
+        let request = async move {
+            let _drop_flag = DropFlag(request_dropped);
+            std::future::pending::<()>().await;
+        };
+        let channel = futures::stream::iter([request]).chain(futures::stream::pending());
+        assert!(drive_channel_for_lifetime(channel, std::time::Duration::from_millis(1)).await);
+        tokio::task::yield_now().await;
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn cached_server_key_survives_key_file_replacement() {
+        let mut rng = rand_core::OsRng;
+        let original = PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
+        let replacement = PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("id_ed25519");
+        std::fs::write(&path, original.to_openssh(LineEnding::LF).unwrap()).unwrap();
+        let snapshot = auth::read_server_key_snapshot(&path).unwrap();
+
+        let public_key_line = original.public_key().to_openssh().unwrap();
+        let recipient = ssh::Recipient::from_str(&public_key_line).unwrap();
+        let recipients: Vec<&dyn age::Recipient> = vec![&recipient];
+        let encryptor = Encryptor::with_recipients(recipients.into_iter()).unwrap();
+        let mut encrypted = Vec::new();
+        let mut writer = encryptor.wrap_output(&mut encrypted).unwrap();
+        use std::io::Write;
+        writer.write_all(b"cached identity").unwrap();
+        writer.finish().unwrap();
+
+        std::fs::write(&path, replacement.to_openssh(LineEnding::LF).unwrap()).unwrap();
+        let blob = AgeEncryptedBlob {
+            ver: PROTOCOL_VERSION,
+            data: encrypted,
+        };
+        assert_eq!(
+            decrypt_blob(snapshot.encoded.as_slice(), &blob).unwrap(),
+            "cached identity"
+        );
     }
 }

@@ -52,6 +52,7 @@ enum ListenAddr {
 struct ClientCredentials {
     private_key_path: String,
     private_key: PrivateKey,
+    public_key: PublicKey,
     public_key_line: String,
     server_public_key_line: String,
     server_public_key: PublicKey,
@@ -179,6 +180,7 @@ fn load_client_credentials(config: Option<&Config>) -> Result<ClientCredentials,
     Ok(ClientCredentials {
         private_key_path,
         private_key,
+        public_key,
         public_key_line,
         server_public_key_line,
         server_public_key,
@@ -190,11 +192,7 @@ async fn issue_challenge(
     credentials: &ClientCredentials,
     operation: ClipboardOperation,
 ) -> Result<Challenge, String> {
-    let request = auth::sign_challenge_request(
-        &credentials.private_key,
-        credentials.public_key_line.clone(),
-        operation,
-    )?;
+    let request = auth::make_challenge_request(credentials.public_key_line.clone(), operation);
     let challenge = client
         .issue_challenge(context::current(), request)
         .await
@@ -202,6 +200,13 @@ async fn issue_challenge(
     challenge
         .validate_version()
         .map_err(|e| format!("server returned incompatible challenge: {e}"))?;
+    auth::verify_server_challenge(
+        &credentials.server_public_key,
+        &challenge,
+        &credentials.public_key,
+        operation,
+    )
+    .map_err(|e| format!("server challenge failed authentication: {e}"))?;
     Ok(challenge)
 }
 
