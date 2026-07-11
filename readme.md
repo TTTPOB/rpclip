@@ -66,6 +66,8 @@ cat something | rpclip-client set
 
 The `get` command fetches the current clipboard content from the server (local windows computer), and the `set` command updates the server's clipboard with the content piped into the client.
 
+The `set` client loads its configuration and keys, reads stdin to EOF, and encrypts the complete payload before it opens the RPC connection. Slow producers can take as long as they need before the server's channel lifetime starts.
+
 ## Configuration
 The client supports configuration through a file. By default it loads `~/.config/rpclip/config.yaml` (or pass `--config <PATH>`). Both `get` and `set` use the client key to sign requests. Both commands also require the server public key so the client can verify clipboard responses and encrypt clipboard updates:
 ```yaml
@@ -88,4 +90,4 @@ For each operation, the server checks the requested client key against the autho
 
 For `get`, the server encrypts the clipboard to the client key and signs the response with its private key. For `set`, the server signs the successful result and binds it to the client's identity, challenge, and ciphertext. The client verifies either success response against `server_ssh_pubkey` before it prints data or exits successfully. Protocol version 5 changes the RPC schema, so version 5 clients require a version 5 server.
 
-The server limits itself to 64 open RPC channels, eight concurrent requests per channel, and a 15-second channel lifetime. RpClip targets loopback and SSH-forwarded use with short-lived clients. A peer that maintains an active connection flood can still deny service; restrict the listening address and SSH access at deployment time.
+The server limits itself to 64 open RPC channels, eight concurrent requests per channel, and a 15-second channel lifetime. Challenge signing allows a burst of four requests per authorized key and refills one token per second. A global bucket allows a burst of 32 and refills eight tokens per second. Someone who knows an authorized public key can consume that key's challenge allowance; the global bucket bounds server signing work. RpClip targets loopback and SSH-forwarded use with short-lived clients. A peer that maintains an active connection flood can still deny service; restrict the listening address and SSH access at deployment time.
