@@ -6,8 +6,9 @@ use futures::prelude::*;
 use log::{error, info};
 use rpclip::auth::{self, AuthorizedClients, ChallengeStore, ServerAuthenticator};
 use rpclip::{
-    AgeEncryptedBlob, AuthRequest, Challenge, ChallengeRequest, RpClip, SetRequest,
-    SignedClipboard, SignedSetResponse, PROTOCOL_VERSION,
+    read_clipboard_payload, validate_clipboard_payload_len,
+    validate_encrypted_clipboard_payload_len, AgeEncryptedBlob, AuthRequest, Challenge,
+    ChallengeRequest, RpClip, SetRequest, SignedClipboard, SignedSetResponse, PROTOCOL_VERSION,
 };
 use std::str::FromStr;
 use std::{
@@ -76,6 +77,7 @@ impl RpClip for RpClipServer {
         _: context::Context,
         request: SetRequest,
     ) -> Result<SignedSetResponse, String> {
+        validate_encrypted_clipboard_payload_len(request.blob.data.len())?;
         self.authenticator.authenticate_set(&request)?;
         let response = self.authenticator.sign_set_response(&request)?;
 
@@ -128,6 +130,7 @@ fn encrypt_clipboard(
             return Err(format!("failed to read system clipboard: {e}"));
         }
     };
+    validate_clipboard_payload_len(text.len())?;
 
     // Encrypt to client's SSH public key
     let recipient = match ssh::Recipient::from_str(&client_ssh_pubkey_line) {
@@ -162,6 +165,7 @@ fn encrypt_clipboard(
         error!("encrypt finish error: {}", e);
         return Err(format!("failed to finish clipboard encryption: {e}"));
     }
+    validate_encrypted_clipboard_payload_len(out.len())?;
 
     Ok(AgeEncryptedBlob {
         ver: PROTOCOL_VERSION,
@@ -209,12 +213,10 @@ fn decrypt_blob(ssh_key_bytes: &[u8], blob: &AgeEncryptedBlob) -> Result<String,
             return Err(format!("failed to decrypt clipboard data: {e}"));
         }
     };
-    use std::io::Read;
-    let mut plaintext = Vec::new();
-    if let Err(e) = reader.read_to_end(&mut plaintext) {
-        error!("decrypt read error: {}", e);
-        return Err(format!("failed to decrypt clipboard data: {e}"));
-    }
+    let plaintext = read_clipboard_payload(&mut reader).map_err(|e| {
+        error!("decrypt read error: {e}");
+        format!("failed to decrypt clipboard data: {e}")
+    })?;
 
     match String::from_utf8(plaintext) {
         Ok(s) => Ok(s),
@@ -479,5 +481,33 @@ mod tests {
             decrypt_blob(snapshot.encoded.as_slice(), &blob).unwrap(),
             "cached identity"
         );
+    }
+
+    #[test]
+    fn rejects_decrypted_clipboard_above_limit() {
+        let mut rng = rand_core::OsRng;
+        let private = PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
+        let public_key_line = private.public_key().to_openssh().unwrap();
+        let recipient = ssh::Recipient::from_str(&public_key_line).unwrap();
+        let recipients: Vec<&dyn age::Recipient> = vec![&recipient];
+        let encryptor = Encryptor::with_recipients(recipients.into_iter()).unwrap();
+        let mut encrypted = Vec::new();
+        let mut writer = encryptor.wrap_output(&mut encrypted).unwrap();
+        use std::io::Write;
+        writer
+            .write_all(&vec![b'x'; rpclip::MAX_CLIPBOARD_PAYLOAD_BYTES + 1])
+            .unwrap();
+        writer.finish().unwrap();
+        let blob = AgeEncryptedBlob {
+            ver: PROTOCOL_VERSION,
+            data: encrypted,
+        };
+
+        assert!(decrypt_blob(
+            private.to_openssh(LineEnding::LF).unwrap().as_bytes(),
+            &blob
+        )
+        .unwrap_err()
+        .contains("clipboard payload exceeds"));
     }
 }

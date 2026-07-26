@@ -1,8 +1,43 @@
 use serde::{Deserialize, Serialize};
+use std::io::{self, Read};
 
 pub mod auth;
 
 pub const PROTOCOL_VERSION: u8 = 5;
+/// Keeps encrypted RPC messages well below tarpc's 8 MiB default frame limit.
+pub const MAX_CLIPBOARD_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// Allows age's header and authenticated chunk overhead for a maximum-size clipboard payload.
+pub const MAX_ENCRYPTED_CLIPBOARD_PAYLOAD_BYTES: usize = MAX_CLIPBOARD_PAYLOAD_BYTES + 64 * 1024;
+
+pub fn validate_clipboard_payload_len(len: usize) -> Result<(), String> {
+    if len <= MAX_CLIPBOARD_PAYLOAD_BYTES {
+        Ok(())
+    } else {
+        Err(format!(
+            "clipboard payload exceeds {MAX_CLIPBOARD_PAYLOAD_BYTES} byte limit"
+        ))
+    }
+}
+
+pub fn validate_encrypted_clipboard_payload_len(len: usize) -> Result<(), String> {
+    if len <= MAX_ENCRYPTED_CLIPBOARD_PAYLOAD_BYTES {
+        Ok(())
+    } else {
+        Err(format!(
+            "encrypted clipboard payload exceeds {MAX_ENCRYPTED_CLIPBOARD_PAYLOAD_BYTES} byte limit"
+        ))
+    }
+}
+
+pub fn read_clipboard_payload(reader: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    reader
+        .take(MAX_CLIPBOARD_PAYLOAD_BYTES as u64 + 1)
+        .read_to_end(&mut payload)?;
+    validate_clipboard_payload_len(payload.len())
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
+    Ok(payload)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ClipboardOperation {
@@ -158,6 +193,38 @@ pub mod line_end {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn reads_clipboard_payload_at_limit() {
+        let mut input = Cursor::new(vec![b'x'; MAX_CLIPBOARD_PAYLOAD_BYTES]);
+
+        assert_eq!(
+            read_clipboard_payload(&mut input).unwrap().len(),
+            MAX_CLIPBOARD_PAYLOAD_BYTES
+        );
+    }
+
+    #[test]
+    fn rejects_clipboard_payload_above_limit() {
+        let mut input = Cursor::new(vec![b'x'; MAX_CLIPBOARD_PAYLOAD_BYTES + 1]);
+
+        assert_eq!(
+            read_clipboard_payload(&mut input).unwrap_err().to_string(),
+            format!("clipboard payload exceeds {MAX_CLIPBOARD_PAYLOAD_BYTES} byte limit")
+        );
+    }
+
+    #[test]
+    fn rejects_encrypted_clipboard_payload_above_limit() {
+        assert_eq!(
+            validate_encrypted_clipboard_payload_len(MAX_ENCRYPTED_CLIPBOARD_PAYLOAD_BYTES + 1)
+                .unwrap_err(),
+            format!(
+                "encrypted clipboard payload exceeds {MAX_ENCRYPTED_CLIPBOARD_PAYLOAD_BYTES} byte limit"
+            )
+        );
+    }
 
     #[test]
     fn validates_encrypted_blob_version() {

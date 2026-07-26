@@ -4,7 +4,8 @@ use clap::{Parser, Subcommand};
 use log::{error, info, warn};
 use rpclip::auth;
 use rpclip::{
-    AgeEncryptedBlob, Challenge, ClipboardOperation, RpClipClient, SetRequest, PROTOCOL_VERSION,
+    read_clipboard_payload, validate_encrypted_clipboard_payload_len, AgeEncryptedBlob, Challenge,
+    ClipboardOperation, RpClipClient, SetRequest, PROTOCOL_VERSION,
 };
 use serde::Deserialize;
 use ssh_key::{PrivateKey, PublicKey};
@@ -281,12 +282,12 @@ fn prepare_client(args: Args, stdin: &mut impl Read) -> Result<PreparedClient, S
     let command = match args.command {
         Commands::Get => PreparedCommand::Get,
         Commands::Set => {
-            let mut text = String::new();
-            stdin
-                .read_to_string(&mut text)
-                .map_err(|e| format!("read stdin: {e}"))?;
+            let plaintext =
+                read_clipboard_payload(stdin).map_err(|e| format!("read stdin: {e}"))?;
+            std::str::from_utf8(&plaintext).map_err(|e| format!("read stdin: {e}"))?;
             let ciphertext =
-                encrypt_to_pubkey_line(&credentials.server_public_key_line, text.as_bytes())?;
+                encrypt_to_pubkey_line(&credentials.server_public_key_line, &plaintext)?;
+            validate_encrypted_clipboard_payload_len(ciphertext.len())?;
             PreparedCommand::Set(AgeEncryptedBlob {
                 ver: PROTOCOL_VERSION,
                 data: ciphertext,
@@ -316,12 +317,7 @@ fn decrypt_with_private_key_path(
     let mut reader = decryptor
         .decrypt(std::iter::once(&identity as &dyn age::Identity))
         .map_err(|e| format!("decrypt: {}", e))?;
-    use std::io::Read;
-    let mut plaintext = Vec::new();
-    reader
-        .read_to_end(&mut plaintext)
-        .map_err(|e| format!("read: {}", e))?;
-    Ok(plaintext)
+    read_clipboard_payload(&mut reader).map_err(|e| format!("read: {e}"))
 }
 
 #[tokio::main]
@@ -374,6 +370,10 @@ async fn main() {
                 auth::verify_get_response(&credentials.server_public_key, &auth_request, &response)
             {
                 error!("Server clipboard response failed authentication: {e}");
+                std::process::exit(1);
+            }
+            if let Err(e) = validate_encrypted_clipboard_payload_len(response.blob.data.len()) {
+                error!("Server clipboard response exceeds payload limit: {e}");
                 std::process::exit(1);
             }
 
@@ -441,6 +441,10 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rpclip::{
+        validate_encrypted_clipboard_payload_len, MAX_CLIPBOARD_PAYLOAD_BYTES,
+        MAX_ENCRYPTED_CLIPBOARD_PAYLOAD_BYTES,
+    };
     use ssh_key::{Algorithm, LineEnding};
     use std::io::Cursor;
     use std::time::{Duration, Instant};
@@ -568,5 +572,30 @@ mod tests {
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         ));
+    }
+
+    #[test]
+    fn rejects_decrypted_clipboard_above_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (private_key_path, public_key_line) = write_test_key(dir.path(), "client_ed25519");
+        let plaintext = vec![b'x'; MAX_CLIPBOARD_PAYLOAD_BYTES + 1];
+        let ciphertext = encrypt_to_pubkey_line(&public_key_line, &plaintext).unwrap();
+
+        assert!(
+            decrypt_with_private_key_path(&private_key_path, &ciphertext)
+                .unwrap_err()
+                .contains("clipboard payload exceeds")
+        );
+    }
+
+    #[test]
+    fn encrypts_maximum_clipboard_within_encrypted_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, public_key_line) = write_test_key(dir.path(), "server_ed25519");
+        let plaintext = vec![b'x'; MAX_CLIPBOARD_PAYLOAD_BYTES];
+        let ciphertext = encrypt_to_pubkey_line(&public_key_line, &plaintext).unwrap();
+
+        assert!(ciphertext.len() <= MAX_ENCRYPTED_CLIPBOARD_PAYLOAD_BYTES);
+        validate_encrypted_clipboard_payload_len(ciphertext.len()).unwrap();
     }
 }
