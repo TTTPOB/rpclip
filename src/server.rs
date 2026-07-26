@@ -23,6 +23,7 @@ use tarpc::{
 
 const MAX_OPEN_CHANNELS: u32 = 64;
 const MAX_CONCURRENT_REQUESTS_PER_CHANNEL: usize = 8;
+const MAX_CONCURRENT_CLIPBOARD_OPERATIONS: usize = 1;
 const CHANNEL_LIFETIME: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Parser)]
@@ -40,6 +41,7 @@ struct Args {
 #[derive(Clone)]
 struct RpClipServer {
     clipboard: Arc<Mutex<Clipboard>>,
+    clipboard_operation_permits: Arc<tokio::sync::Semaphore>,
     ssh_key_bytes: Arc<Vec<u8>>,
     authenticator: Arc<ServerAuthenticator>,
 }
@@ -62,12 +64,11 @@ impl RpClip for RpClipServer {
 
         let clipboard = self.clipboard.clone();
         let authenticator = self.authenticator.clone();
-        tokio::task::spawn_blocking(move || {
+        run_clipboard_operation(self.clipboard_operation_permits.clone(), move || {
             let blob = encrypt_clipboard(clipboard, auth_request.client_ssh_pubkey.clone())?;
             authenticator.sign_get_response(&auth_request, blob)
         })
         .await
-        .map_err(|e| format!("clipboard worker failed: {e}"))?
     }
 
     async fn set_clip(
@@ -81,13 +82,32 @@ impl RpClip for RpClipServer {
         let clipboard = self.clipboard.clone();
         let ssh_key_bytes = self.ssh_key_bytes.clone();
         let blob = request.blob;
-        tokio::task::spawn_blocking(move || {
+        run_clipboard_operation(self.clipboard_operation_permits.clone(), move || {
             decrypt_and_set_clipboard(clipboard, ssh_key_bytes, blob)
         })
-        .await
-        .map_err(|e| format!("clipboard worker failed: {e}"))??;
+        .await?;
         Ok(response)
     }
+}
+
+async fn run_clipboard_operation<T>(
+    permits: Arc<tokio::sync::Semaphore>,
+    operation: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+{
+    // Waiting requests can be canceled before they enter Tokio's blocking pool.
+    let permit = permits
+        .acquire_owned()
+        .await
+        .map_err(|_| "clipboard operation limiter was closed".to_string())?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .map_err(|e| format!("clipboard worker failed: {e}"))?
 }
 
 fn encrypt_clipboard(
@@ -304,6 +324,9 @@ async fn main() {
     info!("Clipboard server started");
     let rpserver = RpClipServer {
         clipboard,
+        clipboard_operation_permits: Arc::new(tokio::sync::Semaphore::new(
+            MAX_CONCURRENT_CLIPBOARD_OPERATIONS,
+        )),
         ssh_key_bytes,
         authenticator,
     };
@@ -393,6 +416,38 @@ mod tests {
         assert!(drive_channel_for_lifetime(channel, std::time::Duration::from_millis(1)).await);
         tokio::task::yield_now().await;
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn channel_timeout_cancels_queued_clipboard_operation() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let running = tokio::spawn(run_clipboard_operation(permits.clone(), move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(())
+        }));
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let queued_started = Arc::new(AtomicBool::new(false));
+        let queued_operation_started = queued_started.clone();
+        let queued = async move {
+            let _ = run_clipboard_operation(permits, move || {
+                queued_operation_started.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+        };
+        let channel = futures::stream::iter([queued]).chain(futures::stream::pending());
+        assert!(drive_channel_for_lifetime(channel, std::time::Duration::from_millis(1)).await);
+
+        release_tx.send(()).unwrap();
+        running.await.unwrap().unwrap();
+        tokio::task::yield_now().await;
+        assert!(!queued_started.load(Ordering::SeqCst));
     }
 
     #[test]
