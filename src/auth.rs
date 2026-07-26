@@ -1116,6 +1116,70 @@ mod tests {
     }
 
     #[test]
+    fn production_authenticator_rejects_future_issued_challenge() {
+        let client = keypair();
+        let server = keypair();
+        let authenticator = authenticator(&client, &server);
+        let now = unix_time_seconds().unwrap();
+        let mut future = Challenge {
+            ver: PROTOCOL_VERSION,
+            operation: ClipboardOperation::Get,
+            client_fingerprint: client.public_key().fingerprint(HashAlg::Sha256).to_string(),
+            nonce: [10; 32],
+            issued_at_unix_seconds: now + 10 * CHALLENGE_TTL.as_secs(),
+            expires_at_unix_seconds: now + 11 * CHALLENGE_TTL.as_secs(),
+            signature: String::new(),
+        };
+        future.signature = sign(
+            &server,
+            CHALLENGE_SIGNATURE_NAMESPACE,
+            &challenge_signing_bytes(&future).unwrap(),
+        )
+        .unwrap();
+        let request =
+            sign_get_request(&client, client.public_key().to_openssh().unwrap(), future).unwrap();
+
+        assert_eq!(
+            authenticator.authenticate_get(&request).unwrap_err(),
+            "authentication challenge was issued in the future"
+        );
+    }
+
+    #[test]
+    fn production_authenticator_rejects_challenge_with_invalid_lifetime() {
+        let client = keypair();
+        let server = keypair();
+        let authenticator = authenticator(&client, &server);
+        let now = unix_time_seconds().unwrap();
+        let mut invalid_lifetime = Challenge {
+            ver: PROTOCOL_VERSION,
+            operation: ClipboardOperation::Get,
+            client_fingerprint: client.public_key().fingerprint(HashAlg::Sha256).to_string(),
+            nonce: [11; 32],
+            issued_at_unix_seconds: now - 10 * CHALLENGE_TTL.as_secs(),
+            expires_at_unix_seconds: now + 1_000 * CHALLENGE_TTL.as_secs(),
+            signature: String::new(),
+        };
+        invalid_lifetime.signature = sign(
+            &server,
+            CHALLENGE_SIGNATURE_NAMESPACE,
+            &challenge_signing_bytes(&invalid_lifetime).unwrap(),
+        )
+        .unwrap();
+        let request = sign_get_request(
+            &client,
+            client.public_key().to_openssh().unwrap(),
+            invalid_lifetime,
+        )
+        .unwrap();
+
+        assert_eq!(
+            authenticator.authenticate_get(&request).unwrap_err(),
+            "authentication challenge has an invalid lifetime"
+        );
+    }
+
+    #[test]
     fn rejects_tampered_server_response() {
         let client = keypair();
         let server = keypair();
